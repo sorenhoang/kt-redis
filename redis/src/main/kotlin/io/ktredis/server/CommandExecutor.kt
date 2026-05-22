@@ -12,6 +12,7 @@ class CommandExecutor(private val scope: CoroutineScope) {
     private val blocking = BlockingManager(db)
     private val mailbox = Channel<() -> Unit>(Channel.UNLIMITED)
     private val pubsub = PubSub()
+    private val watchers = HashMap<String, MutableSet<ClientHandle>>()   // key -> client đang WATCH
 
     init {
         // single-writer: chạy mọi task tuần tự
@@ -37,21 +38,43 @@ class CommandExecutor(private val scope: CoroutineScope) {
             return
         }
 
-        mailbox.send {
-            if (name in PUBSUB_COMMANDS) {
-                handlePubSub(name, args, client)              // tự đẩy ack/message/count vào outgoing
-                return@send
-            }
-            val result = try {
-                dispatcher.dispatch(args)
-            } catch (e: Throwable) {
-                RespValue.error("ERR ${e.message}")
-            }
-            if (name in PUSH_COMMANDS && result is RespValue.Integer) {
-                blocking.notifyKey(args[1].toString(Charsets.UTF_8))
-            }
-            client.outgoing.trySend(result)                   // mọi reply đều đi qua outgoing
+        mailbox.send { runOnExecutor(name, args, client) }
+    }
+
+    private fun runOnExecutor(name: String, args: List<ByteArray>, client: ClientHandle) {
+        when (name) {
+            "MULTI"   -> { multi(client); return }
+            "EXEC"    -> { exec(client); return }
+            "DISCARD" -> { discard(client); return }
+            "WATCH"   -> { watch(args, client); return }
+            "UNWATCH" -> { unwatch(client); return }
         }
+        // đang trong MULTI -> xếp hàng (các lệnh điều khiển ở trên đã được xử lý)
+        if (client.inMulti) {
+            client.queued.add(args)
+            client.outgoing.trySend(RespValue.SimpleString("QUEUED"))
+            return
+        }
+        // lệnh thường
+        if (name in PUBSUB_COMMANDS) {
+            handlePubSub(name, args, client)                  // tự đẩy ack/message/count vào outgoing
+            return
+        }
+        client.outgoing.trySend(dispatchOnly(name, args))     // mọi reply đều đi qua outgoing
+    }
+
+    /** Chạy một lệnh (không pub/sub) và TRẢ về kết quả; dùng chung cho lệnh thường lẫn EXEC. */
+    private fun dispatchOnly(name: String, args: List<ByteArray>): RespValue {
+        val result = try {
+            dispatcher.dispatch(args)
+        } catch (e: Throwable) {
+            RespValue.error("ERR ${e.message}")
+        }
+        if (name in PUSH_COMMANDS && result is RespValue.Integer) {
+            blocking.notifyKey(args[1].toString(Charsets.UTF_8))
+        }
+        if (name in WRITE_COMMANDS) touchKey(args)            // báo cho client đang WATCH
+        return result
     }
 
     /**
@@ -116,12 +139,84 @@ class CommandExecutor(private val scope: CoroutineScope) {
         }
     }
 
+    // ---------- transaction ----------
+    private fun multi(client: ClientHandle) {
+        if (client.inMulti) { client.outgoing.trySend(RespValue.error("ERR MULTI calls can not be nested")); return }
+        client.inMulti = true; client.queued.clear(); client.txError = false
+        client.outgoing.trySend(RespValue.OK)
+    }
+
+    private fun discard(client: ClientHandle) {
+        if (!client.inMulti) { client.outgoing.trySend(RespValue.error("ERR DISCARD without MULTI")); return }
+        resetTx(client)
+        client.outgoing.trySend(RespValue.OK)
+    }
+
+    private fun exec(client: ClientHandle) {
+        if (!client.inMulti) { client.outgoing.trySend(RespValue.error("ERR EXEC without MULTI")); return }
+        if (client.txError) {
+            resetTx(client)
+            client.outgoing.trySend(RespValue.error("EXECABORT Transaction discarded because of previous errors."))
+            return
+        }
+        if (client.dirty) {                                   // watched key đã đổi -> huỷ
+            resetTx(client)
+            client.outgoing.trySend(RespValue.Array(null))    // nil array
+            return
+        }
+        val results = client.queued.map { qargs ->
+            dispatchOnly(qargs[0].toString(Charsets.UTF_8).uppercase(), qargs)
+        }
+        resetTx(client)
+        client.outgoing.trySend(RespValue.Array(results))     // chạy nguyên khối -> atomic
+    }
+
+    private fun watch(args: List<ByteArray>, client: ClientHandle) {
+        if (client.inMulti) { client.outgoing.trySend(RespValue.error("ERR WATCH inside MULTI is not allowed")); return }
+        for (i in 1 until args.size) {
+            val key = args[i].toString(Charsets.UTF_8)
+            watchers.getOrPut(key) { HashSet() }.add(client)
+            client.watchedKeys.add(key)
+        }
+        client.outgoing.trySend(RespValue.OK)
+    }
+
+    private fun unwatch(client: ClientHandle) {
+        clearWatches(client)
+        client.outgoing.trySend(RespValue.OK)
+    }
+
+    /** Sau mỗi lệnh ghi: đánh dấu dirty cho client đang WATCH key này. */
+    private fun touchKey(args: List<ByteArray>) {
+        if (args.size < 2) return
+        val key = args[1].toString(Charsets.UTF_8)
+        watchers[key]?.forEach { it.dirty = true }
+    }
+
+    private fun resetTx(client: ClientHandle) {
+        client.inMulti = false; client.queued.clear(); client.txError = false
+        clearWatches(client)
+    }
+
+    private fun clearWatches(client: ClientHandle) {
+        client.watchedKeys.forEach { watchers[it]?.remove(client) }
+        client.watchedKeys.clear(); client.dirty = false
+    }
+
     suspend fun disconnect(client: ClientHandle) {
-        mailbox.send { pubsub.removeClient(client) }
+        mailbox.send { pubsub.removeClient(client); clearWatches(client) }
     }
 
     companion object {
         private val PUSH_COMMANDS = setOf("RPUSH", "LPUSH", "RPUSHX", "LPUSHX")
         private val PUBSUB_COMMANDS = setOf("SUBSCRIBE", "UNSUBSCRIBE", "PSUBSCRIBE", "PUNSUBSCRIBE", "PUBLISH")
+        private val WRITE_COMMANDS = setOf(
+            "SET", "DEL", "EXPIRE", "PEXPIRE", "PERSIST", "RENAME", "INCR", "DECR", "INCRBY", "DECRBY",
+            "APPEND", "SETRANGE", "MSET",
+            "RPUSH", "LPUSH", "RPUSHX", "LPUSHX", "LPOP", "RPOP", "LSET",
+            "HSET", "HDEL", "HINCRBY",
+            "SADD", "SREM", "SPOP", "SINTERSTORE", "SUNIONSTORE", "SDIFFSTORE",
+            "ZADD", "ZREM", "ZINCRBY"
+        )
     }
 }

@@ -8,4 +8,11 @@ class ClientHandle{
     val channels = HashSet<String>()
     val patterns = HashSet<String>()
     val subscriptionCount: Int get() = channels.size + patterns.size
+
+    // --- transaction ---
+    var inMulti = false
+    val queued = ArrayList<List<ByteArray>>()
+    var txError = false
+    val watchedKeys = HashSet<String>()
+    var dirty = false
 }
