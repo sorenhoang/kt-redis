@@ -36,6 +36,16 @@ class CommandDispatcher(private val db: RedisDatabase) {
             "SETRANGE" -> setrange(args)
             "MSET"     -> mset(args)
             "MGET"     -> mget(args)
+            "RPUSH"  -> push(args, atHead = false, requireExists = false)
+            "LPUSH"  -> push(args, atHead = true,  requireExists = false)
+            "RPUSHX" -> push(args, atHead = false, requireExists = true)
+            "LPUSHX" -> push(args, atHead = true,  requireExists = true)
+            "LLEN"   -> llen(args)
+            "LRANGE" -> lrange(args)
+            "LINDEX" -> lindex(args)
+            "LSET"   -> lset(args)
+            "LPOP"   -> pop(args, fromHead = true)
+            "RPOP"   -> pop(args, fromHead = false)
             else      -> RespValue.error("ERR unknown command '${keyOf(args[0])}'")
         }
     }
@@ -135,6 +145,7 @@ class CommandDispatcher(private val db: RedisDatabase) {
         return RespValue.SimpleString(
             when (obj) {
                 is RedisObject.StringValue -> "string"
+                is RedisObject.ListValue   -> "list"
             }
         )
     }
@@ -272,5 +283,92 @@ class CommandDispatcher(private val db: RedisDatabase) {
             if (obj is RedisObject.StringValue) RespValue.bulk(obj.data) else RespValue.NIL
         }
         return RespValue.Array(items)
+    }
+
+    private fun listForRead(key: String): Pair<RespValue?, ArrayDeque<ByteArray>?> {
+        val obj = db.get(key) ?: return null to null
+        if (obj !is RedisObject.ListValue) return wrongType() to null
+        return null to obj.items
+    }
+
+    private fun push(args: List<ByteArray>, atHead: Boolean, requireExists: Boolean): RespValue {
+        if (args.size < 3) return RespValue.error("ERR wrong number of arguments")
+        val key = keyOf(args[1])
+        val obj = db.get(key)
+        if (obj != null && obj !is RedisObject.ListValue) return wrongType()
+        if (obj == null && requireExists) return RespValue.int(0)        // *PUSHX khi key chưa có
+        val list = if (obj is RedisObject.ListValue) obj.items
+        else ArrayDeque<ByteArray>().also { db.setKeepTtl(key, RedisObject.ListValue(it)) }
+        for (i in 2 until args.size) {
+            if (atHead) list.addFirst(args[i]) else list.addLast(args[i])
+        }
+        return RespValue.int(list.size.toLong())
+    }
+
+    private fun llen(args: List<ByteArray>): RespValue {
+        if (args.size != 2) return RespValue.error("ERR wrong number of arguments")
+        val (err, list) = listForRead(keyOf(args[1]))
+        if (err != null) return err
+        return RespValue.int((list?.size ?: 0).toLong())
+    }
+
+    private fun lrange(args: List<ByteArray>): RespValue {
+        if (args.size != 4) return RespValue.error("ERR wrong number of arguments")
+        val (err, list) = listForRead(keyOf(args[1]))
+        if (err != null) return err
+        if (list == null) return RespValue.Array(emptyList())
+        val len = list.size
+        var start = keyOf(args[2]).toIntOrNull() ?: return notInteger()
+        var stop  = keyOf(args[3]).toIntOrNull() ?: return notInteger()
+        if (start < 0) start += len
+        if (stop  < 0) stop  += len
+        if (start < 0) start = 0
+        if (stop >= len) stop = len - 1
+        if (start > stop) return RespValue.Array(emptyList())
+        return RespValue.Array((start..stop).map { RespValue.bulk(list[it]) })
+    }
+
+    private fun lindex(args: List<ByteArray>): RespValue {
+        if (args.size != 3) return RespValue.error("ERR wrong number of arguments")
+        val (err, list) = listForRead(keyOf(args[1]))
+        if (err != null) return err
+        if (list == null) return RespValue.NIL
+        var idx = keyOf(args[2]).toIntOrNull() ?: return notInteger()
+        if (idx < 0) idx += list.size
+        if (idx < 0 || idx >= list.size) return RespValue.NIL
+        return RespValue.bulk(list[idx])
+    }
+
+    private fun lset(args: List<ByteArray>): RespValue {
+        if (args.size != 4) return RespValue.error("ERR wrong number of arguments")
+        val (err, list) = listForRead(keyOf(args[1]))
+        if (err != null) return err
+        if (list == null) return RespValue.error("ERR no such key")
+        var idx = keyOf(args[2]).toIntOrNull() ?: return notInteger()
+        if (idx < 0) idx += list.size
+        if (idx < 0 || idx >= list.size) return RespValue.error("ERR index out of range")
+        list[idx] = args[3]
+        return RespValue.OK
+    }
+
+    private fun pop(args: List<ByteArray>, fromHead: Boolean): RespValue {
+        if (args.size !in 2..3) return RespValue.error("ERR wrong number of arguments")
+        val key = keyOf(args[1])
+        val (err, list) = listForRead(key)
+        if (err != null) return err
+        val count = if (args.size == 3) (keyOf(args[2]).toIntOrNull() ?: return notInteger()) else null
+        if (count != null && count < 0) return RespValue.error("ERR value is out of range, must be positive")
+        if (list == null || list.isEmpty())
+            return if (count == null) RespValue.NIL else RespValue.Array(emptyList())
+
+        if (count == null) {
+            val v = if (fromHead) list.removeFirst() else list.removeLast()
+            if (list.isEmpty()) db.delete(key)        // Redis không giữ list rỗng
+            return RespValue.bulk(v)
+        }
+        val n = minOf(count, list.size)
+        val out = (1..n).map { RespValue.bulk(if (fromHead) list.removeFirst() else list.removeLast()) }
+        if (list.isEmpty()) db.delete(key)
+        return RespValue.Array(out)
     }
 }
