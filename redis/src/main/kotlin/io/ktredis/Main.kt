@@ -1,6 +1,6 @@
 package io.ktredis
 
-import io.ktredis.server.*
+import io.ktredis.server.RedisServer
 import kotlinx.coroutines.*
 
 fun main()= runBlocking{
