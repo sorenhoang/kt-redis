@@ -30,7 +30,7 @@ class RedisServer(
         try {
             while (true) {
                 val line = reader.readUTF8Line() ?: break   // null = client close
-                writer.writeStringUtf8("$line\r\n")
+                writer.writeStringUtf8("Response: $line\r\n")
             }
         } catch (e: Throwable) {
 
