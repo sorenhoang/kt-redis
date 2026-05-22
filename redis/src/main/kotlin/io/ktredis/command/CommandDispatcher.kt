@@ -20,6 +20,22 @@ class CommandDispatcher(private val db: RedisDatabase) {
             "TTL"     -> ttl(args, seconds = true)
             "PTTL"    -> ttl(args, seconds = false)
             "PERSIST" -> persist(args)
+            "KEYS"     -> keys(args)
+            "TYPE"     -> type(args)
+            "DBSIZE"   -> dbsize(args)
+            "FLUSHDB"  -> flushdb(args)
+            "RENAME"   -> rename(args)
+            "SCAN"     -> scan(args)
+            "INCR"     -> incr(args, 1)
+            "DECR"     -> incr(args, -1)
+            "INCRBY"   -> incrByArg(args, 1)
+            "DECRBY"   -> incrByArg(args, -1)
+            "APPEND"   -> append(args)
+            "STRLEN"   -> strlen(args)
+            "GETRANGE" -> getrange(args)
+            "SETRANGE" -> setrange(args)
+            "MSET"     -> mset(args)
+            "MGET"     -> mget(args)
             else      -> RespValue.error("ERR unknown command '${keyOf(args[0])}'")
         }
     }
@@ -101,5 +117,160 @@ class CommandDispatcher(private val db: RedisDatabase) {
     private fun persist(args: List<ByteArray>): RespValue {
         if (args.size != 2) return RespValue.error("ERR wrong number of arguments")
         return RespValue.int(if (db.persist(keyOf(args[1]))) 1 else 0)
+    }
+
+    // ---------- keyspace ----------
+    private fun wrongType() =
+        RespValue.error("WRONGTYPE Operation against a key holding the wrong kind of value")
+
+    private fun keys(args: List<ByteArray>): RespValue {
+        if (args.size != 2) return RespValue.error("ERR wrong number of arguments for 'keys' command")
+        val pattern = keyOf(args[1])
+        return RespValue.Array(db.keys().filter { globMatch(pattern, it) }.map { RespValue.bulk(it) })
+    }
+
+    private fun type(args: List<ByteArray>): RespValue {
+        if (args.size != 2) return RespValue.error("ERR wrong number of arguments for 'type' command")
+        val obj = db.get(keyOf(args[1])) ?: return RespValue.SimpleString("none")
+        return RespValue.SimpleString(
+            when (obj) {
+                is RedisObject.StringValue -> "string"
+            }
+        )
+    }
+
+    private fun dbsize(args: List<ByteArray>): RespValue =
+        RespValue.int(db.keys().size.toLong())
+
+    private fun flushdb(args: List<ByteArray>): RespValue {
+        db.clear()
+        return RespValue.OK
+    }
+
+    private fun rename(args: List<ByteArray>): RespValue {
+        if (args.size != 3) return RespValue.error("ERR wrong number of arguments for 'rename' command")
+        return if (db.rename(keyOf(args[1]), keyOf(args[2]))) RespValue.OK
+        else RespValue.error("ERR no such key")
+    }
+
+    private fun scan(args: List<ByteArray>): RespValue {
+        if (args.size < 2) return RespValue.error("ERR wrong number of arguments for 'scan' command")
+        var pattern = "*"
+        var i = 2
+        while (i < args.size) {
+            when (keyOf(args[i]).uppercase()) {
+                "MATCH" -> { if (i + 1 >= args.size) return syntaxError(); pattern = keyOf(args[i + 1]); i += 2 }
+                "COUNT" -> { if (i + 1 >= args.size) return syntaxError(); i += 2 }   // bỏ qua (đơn giản hoá)
+                else -> return syntaxError()
+            }
+        }
+        val matched = db.keys().filter { globMatch(pattern, it) }
+        return RespValue.Array(
+            listOf(
+                RespValue.bulk("0"),                                  // cursor luôn 0 — quét hết trong 1 lần
+                RespValue.Array(matched.map { RespValue.bulk(it) })
+            )
+        )
+    }
+
+    // ---------- string / số ----------
+    /** Trả (lỗi, data). Không tồn tại -> (null, null). Sai kiểu -> (wrongType, null). */
+    private fun currentString(key: String): Pair<RespValue?, ByteArray?> {
+        val obj = db.get(key) ?: return null to null
+        if (obj !is RedisObject.StringValue) return wrongType() to null
+        return null to obj.data
+    }
+
+    private fun incr(args: List<ByteArray>, by: Long): RespValue {
+        if (args.size != 2) return RespValue.error("ERR wrong number of arguments")
+        return doIncr(keyOf(args[1]), by)
+    }
+
+    private fun incrByArg(args: List<ByteArray>, sign: Long): RespValue {
+        if (args.size != 3) return RespValue.error("ERR wrong number of arguments")
+        val delta = keyOf(args[2]).toLongOrNull() ?: return notInteger()
+        return doIncr(keyOf(args[1]), sign * delta)
+    }
+
+    private fun doIncr(key: String, delta: Long): RespValue {
+        val (err, data) = currentString(key)
+        if (err != null) return err
+        val current = if (data == null) 0L
+            else data.toString(Charsets.UTF_8).toLongOrNull() ?: return notInteger()
+        val next = current + delta
+        db.setKeepTtl(key, RedisObject.StringValue(next.toString().toByteArray()))
+        return RespValue.int(next)
+    }
+
+    private fun append(args: List<ByteArray>): RespValue {
+        if (args.size != 3) return RespValue.error("ERR wrong number of arguments for 'append' command")
+        val key = keyOf(args[1])
+        val (err, data) = currentString(key)
+        if (err != null) return err
+        val combined = (data ?: ByteArray(0)) + args[2]
+        db.setKeepTtl(key, RedisObject.StringValue(combined))
+        return RespValue.int(combined.size.toLong())
+    }
+
+    private fun strlen(args: List<ByteArray>): RespValue {
+        if (args.size != 2) return RespValue.error("ERR wrong number of arguments for 'strlen' command")
+        val (err, data) = currentString(keyOf(args[1]))
+        if (err != null) return err
+        return RespValue.int((data?.size ?: 0).toLong())
+    }
+
+    private fun getrange(args: List<ByteArray>): RespValue {
+        if (args.size != 4) return RespValue.error("ERR wrong number of arguments for 'getrange' command")
+        val (err, data) = currentString(keyOf(args[1]))
+        if (err != null) return err
+        val bytes = data ?: ByteArray(0)
+        val len = bytes.size
+        if (len == 0) return RespValue.bulk("")
+        var start = keyOf(args[2]).toIntOrNull() ?: return notInteger()
+        var end = keyOf(args[3]).toIntOrNull() ?: return notInteger()
+        if (start < 0) start += len
+        if (end < 0) end += len
+        if (start < 0) start = 0
+        if (end >= len) end = len - 1
+        if (start > end) return RespValue.bulk("")
+        return RespValue.bulk(bytes.copyOfRange(start, end + 1))
+    }
+
+    private fun setrange(args: List<ByteArray>): RespValue {
+        if (args.size != 4) return RespValue.error("ERR wrong number of arguments for 'setrange' command")
+        val key = keyOf(args[1])
+        val offset = keyOf(args[2]).toIntOrNull() ?: return notInteger()
+        if (offset < 0) return RespValue.error("ERR offset is out of range")
+        val value = args[3]
+        val (err, data) = currentString(key)
+        if (err != null) return err
+        val base = data ?: ByteArray(0)
+        if (value.isEmpty()) return RespValue.int(base.size.toLong())
+        val newLen = maxOf(base.size, offset + value.size)
+        val result = ByteArray(newLen)                       // tự pad \x00
+        System.arraycopy(base, 0, result, 0, base.size)
+        System.arraycopy(value, 0, result, offset, value.size)
+        db.setKeepTtl(key, RedisObject.StringValue(result))
+        return RespValue.int(newLen.toLong())
+    }
+
+    private fun mset(args: List<ByteArray>): RespValue {
+        if (args.size < 3 || args.size % 2 == 0)
+            return RespValue.error("ERR wrong number of arguments for 'mset' command")
+        var i = 1
+        while (i + 1 < args.size) {
+            db.set(keyOf(args[i]), RedisObject.StringValue(args[i + 1]))   // MSET xoá TTL như SET
+            i += 2
+        }
+        return RespValue.OK
+    }
+
+    private fun mget(args: List<ByteArray>): RespValue {
+        if (args.size < 2) return RespValue.error("ERR wrong number of arguments for 'mget' command")
+        val items = (1 until args.size).map { idx ->
+            val obj = db.get(keyOf(args[idx]))
+            if (obj is RedisObject.StringValue) RespValue.bulk(obj.data) else RespValue.NIL
+        }
+        return RespValue.Array(items)
     }
 }

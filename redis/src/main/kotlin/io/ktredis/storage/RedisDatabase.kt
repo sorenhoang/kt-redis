@@ -57,6 +57,34 @@ class RedisDatabase(private val clock: Clock = SystemClock){
         return expires.remove(key) != null
     }
 
+    // ---------- keyspace ----------
+    /** Danh sách key còn sống (đã dọn key hết hạn trước khi liệt kê). */
+    fun keys(): List<String> {
+        map.keys.toList().forEach { expireIfNeeded(it) }
+        return map.keys.toList()
+    }
+
+    fun clear() {
+        map.clear()
+        expires.clear()
+    }
+
+    /** Đổi tên key, mang theo TTL. Trả false nếu src không tồn tại. */
+    fun rename(src: String, dst: String): Boolean {
+        expireIfNeeded(src)
+        val value = map[src] ?: return false
+        val ttl = expires[src]
+        map.remove(src); expires.remove(src)
+        map[dst] = value
+        if (ttl != null) expires[dst] = ttl else expires.remove(dst)
+        return true
+    }
+
+    /** Ghi value nhưng GIỮ TTL hiện có (cho INCR/APPEND/SETRANGE...). */
+    fun setKeepTtl(key: String, value: RedisObject) {
+        map[key] = value
+    }
+
     // ---------- active expiration ----------
     fun activeExpireCycle(sampleSize: Int = 20) {
         if (expires.isEmpty()) return
