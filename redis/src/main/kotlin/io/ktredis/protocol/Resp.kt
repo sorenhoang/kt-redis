@@ -6,7 +6,7 @@ import java.io.ByteArrayOutputStream
 sealed interface RespValue{
     data class SimpleString(val value: String) : RespValue
     data class Error(val message: String) : RespValue
-    data class Integer(val value: Int) : RespValue
+    data class Integer(val value: Long) : RespValue
     data class BulkString(val data: ByteArray?) : RespValue   // null = $-1
     data class Array(val items: List<RespValue>?) : RespValue // null = *-1
 
@@ -17,7 +17,7 @@ sealed interface RespValue{
         fun bulk(s: String) = BulkString(s.toByteArray())
         fun bulk(b: ByteArray?) = BulkString(b)
         fun error(msg: String) = Error(msg)
-        fun int(n: Long) = Integer(n.toInt())
+        fun int(n: Long) = Integer(n)
     }
 }
 
