@@ -46,6 +46,16 @@ class CommandDispatcher(private val db: RedisDatabase) {
             "LSET"   -> lset(args)
             "LPOP"   -> pop(args, fromHead = true)
             "RPOP"   -> pop(args, fromHead = false)
+            "HSET"    -> hset(args)
+            "HGET"    -> hget(args)
+            "HMGET"   -> hmget(args)
+            "HGETALL" -> hgetall(args)
+            "HDEL"    -> hdel(args)
+            "HEXISTS" -> hexists(args)
+            "HKEYS"   -> hkeys(args)
+            "HVALS"   -> hvals(args)
+            "HLEN"    -> hlen(args)
+            "HINCRBY" -> hincrby(args)
             else      -> RespValue.error("ERR unknown command '${keyOf(args[0])}'")
         }
     }
@@ -146,6 +156,7 @@ class CommandDispatcher(private val db: RedisDatabase) {
             when (obj) {
                 is RedisObject.StringValue -> "string"
                 is RedisObject.ListValue   -> "list"
+                is RedisObject.HashValue -> "hash"
             }
         )
     }
@@ -291,6 +302,12 @@ class CommandDispatcher(private val db: RedisDatabase) {
         return null to obj.items
     }
 
+    fun hashForRead(key: String): Pair<RespValue?, LinkedHashMap<String, ByteArray>?> {
+        val obj = db.get(key) ?: return null to null
+        if (obj !is RedisObject.HashValue) return wrongType() to null
+        return null to obj.fields
+    }
+
     private fun push(args: List<ByteArray>, atHead: Boolean, requireExists: Boolean): RespValue {
         if (args.size < 3) return RespValue.error("ERR wrong number of arguments")
         val key = keyOf(args[1])
@@ -370,5 +387,109 @@ class CommandDispatcher(private val db: RedisDatabase) {
         val out = (1..n).map { RespValue.bulk(if (fromHead) list.removeFirst() else list.removeLast()) }
         if (list.isEmpty()) db.delete(key)
         return RespValue.Array(out)
+    }
+
+    private fun hset(args: List<ByteArray>): RespValue {
+        if (args.size < 4 || args.size % 2 != 0)
+            return RespValue.error("ERR wrong number of arguments for 'hset' command")
+        val key = keyOf(args[1])
+        val obj = db.get(key)
+        if (obj != null && obj !is RedisObject.HashValue) return wrongType()
+        val fields = if (obj is RedisObject.HashValue) obj.fields
+        else LinkedHashMap<String, ByteArray>().also { db.setKeepTtl(key, RedisObject.HashValue(it)) }
+        var added = 0L
+        var i = 2
+        while (i + 1 < args.size) {
+            val f = keyOf(args[i])
+            if (!fields.containsKey(f)) added++          // chỉ đếm field MỚI
+            fields[f] = args[i + 1]
+            i += 2
+        }
+        return RespValue.int(added)
+    }
+
+    private fun hget(args: List<ByteArray>): RespValue {
+        if (args.size != 3) return RespValue.error("ERR wrong number of arguments")
+        val (err, fields) = hashForRead(keyOf(args[1]))
+        if (err != null) return err
+        val v = fields?.get(keyOf(args[2])) ?: return RespValue.NIL
+        return RespValue.bulk(v)
+    }
+
+    private fun hmget(args: List<ByteArray>): RespValue {
+        if (args.size < 3) return RespValue.error("ERR wrong number of arguments")
+        val (err, fields) = hashForRead(keyOf(args[1]))
+        if (err != null) return err
+        val items = (2 until args.size).map { idx ->
+            val v = fields?.get(keyOf(args[idx]))
+            if (v != null) RespValue.bulk(v) else RespValue.NIL
+        }
+        return RespValue.Array(items)
+    }
+
+    private fun hgetall(args: List<ByteArray>): RespValue {
+        if (args.size != 2) return RespValue.error("ERR wrong number of arguments")
+        val (err, fields) = hashForRead(keyOf(args[1]))
+        if (err != null) return err
+        if (fields == null) return RespValue.Array(emptyList())
+        val out = ArrayList<RespValue>(fields.size * 2)
+        for ((f, v) in fields) { out.add(RespValue.bulk(f)); out.add(RespValue.bulk(v)) }
+        return RespValue.Array(out)
+    }
+
+    private fun hdel(args: List<ByteArray>): RespValue {
+        if (args.size < 3) return RespValue.error("ERR wrong number of arguments")
+        val key = keyOf(args[1])
+        val (err, fields) = hashForRead(key)
+        if (err != null) return err
+        if (fields == null) return RespValue.int(0)
+        var removed = 0L
+        for (i in 2 until args.size) if (fields.remove(keyOf(args[i])) != null) removed++
+        if (fields.isEmpty()) db.delete(key)             // hash rỗng -> xoá key
+        return RespValue.int(removed)
+    }
+
+    private fun hexists(args: List<ByteArray>): RespValue {
+        if (args.size != 3) return RespValue.error("ERR wrong number of arguments")
+        val (err, fields) = hashForRead(keyOf(args[1]))
+        if (err != null) return err
+        return RespValue.int(if (fields?.containsKey(keyOf(args[2])) == true) 1 else 0)
+    }
+
+    private fun hkeys(args: List<ByteArray>): RespValue {
+        if (args.size != 2) return RespValue.error("ERR wrong number of arguments")
+        val (err, fields) = hashForRead(keyOf(args[1]))
+        if (err != null) return err
+        return RespValue.Array(fields?.keys?.map { RespValue.bulk(it) } ?: emptyList())
+    }
+
+    private fun hvals(args: List<ByteArray>): RespValue {
+        if (args.size != 2) return RespValue.error("ERR wrong number of arguments")
+        val (err, fields) = hashForRead(keyOf(args[1]))
+        if (err != null) return err
+        return RespValue.Array(fields?.values?.map { RespValue.bulk(it) } ?: emptyList())
+    }
+
+    private fun hlen(args: List<ByteArray>): RespValue {
+        if (args.size != 2) return RespValue.error("ERR wrong number of arguments")
+        val (err, fields) = hashForRead(keyOf(args[1]))
+        if (err != null) return err
+        return RespValue.int((fields?.size ?: 0).toLong())
+    }
+
+    private fun hincrby(args: List<ByteArray>): RespValue {
+        if (args.size != 4) return RespValue.error("ERR wrong number of arguments")
+        val key = keyOf(args[1])
+        val delta = keyOf(args[3]).toLongOrNull() ?: return notInteger()
+        val obj = db.get(key)
+        if (obj != null && obj !is RedisObject.HashValue) return wrongType()
+        val fields = if (obj is RedisObject.HashValue) obj.fields
+        else LinkedHashMap<String, ByteArray>().also { db.setKeepTtl(key, RedisObject.HashValue(it)) }
+        val f = keyOf(args[2])
+        val cur = fields[f]?.toString(Charsets.UTF_8)?.toLongOrNull()
+        if (fields[f] != null && cur == null) return RespValue.error("ERR hash value is not an integer")
+        val next = (cur ?: 0L) + delta
+        fields[f] = next.toString().toByteArray()
+        return RespValue.int(next)
     }
 }
