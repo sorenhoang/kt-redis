@@ -21,21 +21,30 @@ class RedisServer(
         }
     }
 
-    private suspend fun handleClient(socket: Socket, executor: CommandExecutor) {
+    private suspend fun handleClient(socket: Socket, executor: CommandExecutor) = coroutineScope {
         val remote = socket.remoteAddress
         println("client connected: $remote")
         val reader = RespReader(socket.openReadChannel())
-        val writer = socket.openWriteChannel(autoFlush = true)
+        val writeChannel = socket.openWriteChannel(autoFlush = true)
+        val client = ClientHandle()
 
+        // coroutine writer: rút outgoing -> socket (mọi lần ghi đều qua đây)
+        val writer = launch {
+            try {
+                for (reply in client.outgoing) writeChannel.writeResp(reply)
+            } catch (_: Throwable) { /* socket đóng */ }
+        }
         try {
             while (true) {
                 val args = reader.readCommand() ?: break
                 if (args.isEmpty()) continue
-                writer.writeResp(executor.execute(args))
+                executor.execute(args, client)        // reply sẽ vào client.outgoing
             }
         } catch (e: Throwable) {
-
+            println("connection error: ${e.message}")
         } finally {
+            executor.disconnect(client)               // gỡ subscribe
+            client.outgoing.close()                   // writer drain xong rồi kết thúc
             socket.close()
             println("client disconnected: $remote")
         }
