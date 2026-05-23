@@ -1,12 +1,18 @@
 package io.ktredis.server
 
 import io.ktredis.command.CommandDispatcher
+import io.ktredis.persistence.Aof
+import io.ktredis.persistence.FsyncPolicy
 import io.ktredis.protocol.RespValue
 import io.ktredis.storage.RedisDatabase
 import kotlinx.coroutines.*
 import kotlinx.coroutines.channels.Channel
 
-class CommandExecutor(private val scope: CoroutineScope) {
+class CommandExecutor(
+    private val scope: CoroutineScope,
+    private val aof: Aof? = null
+) {
+    private var loading = false
     private val db = RedisDatabase()
     private val dispatcher = CommandDispatcher(db)
     private val blocking = BlockingManager(db)
@@ -18,6 +24,14 @@ class CommandExecutor(private val scope: CoroutineScope) {
         // single-writer: chạy mọi task tuần tự
         scope.launch {
             for (task in mailbox) task()
+
+            if (aof != null && aof.policy == FsyncPolicy.EVERYSEC) {
+                scope.launch {
+                    while (isActive) {
+                        delay(1000); mailbox.send { aof.fsync() }
+                    }
+                }
+            }
         }
         // active expiration
         scope.launch {
@@ -29,7 +43,9 @@ class CommandExecutor(private val scope: CoroutineScope) {
     }
 
     suspend fun execute(args: List<ByteArray>, client: ClientHandle) {
-        if (args.isEmpty()) { client.outgoing.trySend(RespValue.error("ERR empty command")); return }
+        if (args.isEmpty()) {
+            client.outgoing.trySend(RespValue.error("ERR empty command")); return
+        }
         val name = args[0].toString(Charsets.UTF_8).uppercase()
 
         // BLPOP/BRPOP: chờ (suspend) ngay tại connection coroutine, rồi đẩy kết quả ra outgoing
@@ -43,11 +59,25 @@ class CommandExecutor(private val scope: CoroutineScope) {
 
     private fun runOnExecutor(name: String, args: List<ByteArray>, client: ClientHandle) {
         when (name) {
-            "MULTI"   -> { multi(client); return }
-            "EXEC"    -> { exec(client); return }
-            "DISCARD" -> { discard(client); return }
-            "WATCH"   -> { watch(args, client); return }
-            "UNWATCH" -> { unwatch(client); return }
+            "MULTI" -> {
+                multi(client); return
+            }
+
+            "EXEC" -> {
+                exec(client); return
+            }
+
+            "DISCARD" -> {
+                discard(client); return
+            }
+
+            "WATCH" -> {
+                watch(args, client); return
+            }
+
+            "UNWATCH" -> {
+                unwatch(client); return
+            }
         }
         // đang trong MULTI -> xếp hàng (các lệnh điều khiển ở trên đã được xử lý)
         if (client.inMulti) {
@@ -63,7 +93,6 @@ class CommandExecutor(private val scope: CoroutineScope) {
         client.outgoing.trySend(dispatchOnly(name, args))     // mọi reply đều đi qua outgoing
     }
 
-    /** Chạy một lệnh (không pub/sub) và TRẢ về kết quả; dùng chung cho lệnh thường lẫn EXEC. */
     private fun dispatchOnly(name: String, args: List<ByteArray>): RespValue {
         val result = try {
             dispatcher.dispatch(args)
@@ -73,17 +102,14 @@ class CommandExecutor(private val scope: CoroutineScope) {
         if (name in PUSH_COMMANDS && result is RespValue.Integer) {
             blocking.notifyKey(args[1].toString(Charsets.UTF_8))
         }
-        if (name in WRITE_COMMANDS) touchKey(args)            // báo cho client đang WATCH
+
+        if (name in WRITE_COMMANDS) {
+            touchKey(args)
+            if (!loading && aof != null && result !is RespValue.Error) aof.append(args)
+        }
         return result
     }
 
-    /**
-     * BLPOP/BRPOP key [key...] timeout
-     * - Nếu có phần tử: pop ngay, trả [key, value].
-     * - Nếu rỗng hết: chờ tới khi có push vào một trong các key, hoặc hết timeout (-> nil).
-     * Executor KHÔNG bị treo: việc chờ nằm ở connection coroutine (deferred.await), còn task
-     * trong mailbox chỉ đăng ký waiter rồi trả về ngay.
-     */
     private suspend fun executeBlocking(args: List<ByteArray>, fromHead: Boolean): RespValue {
         if (args.size < 3) return RespValue.error("ERR wrong number of arguments for 'blpop' command")
         val timeoutSec = args.last().toString(Charsets.UTF_8).toDoubleOrNull()
@@ -141,19 +167,25 @@ class CommandExecutor(private val scope: CoroutineScope) {
 
     // ---------- transaction ----------
     private fun multi(client: ClientHandle) {
-        if (client.inMulti) { client.outgoing.trySend(RespValue.error("ERR MULTI calls can not be nested")); return }
+        if (client.inMulti) {
+            client.outgoing.trySend(RespValue.error("ERR MULTI calls can not be nested")); return
+        }
         client.inMulti = true; client.queued.clear(); client.txError = false
         client.outgoing.trySend(RespValue.OK)
     }
 
     private fun discard(client: ClientHandle) {
-        if (!client.inMulti) { client.outgoing.trySend(RespValue.error("ERR DISCARD without MULTI")); return }
+        if (!client.inMulti) {
+            client.outgoing.trySend(RespValue.error("ERR DISCARD without MULTI")); return
+        }
         resetTx(client)
         client.outgoing.trySend(RespValue.OK)
     }
 
     private fun exec(client: ClientHandle) {
-        if (!client.inMulti) { client.outgoing.trySend(RespValue.error("ERR EXEC without MULTI")); return }
+        if (!client.inMulti) {
+            client.outgoing.trySend(RespValue.error("ERR EXEC without MULTI")); return
+        }
         if (client.txError) {
             resetTx(client)
             client.outgoing.trySend(RespValue.error("EXECABORT Transaction discarded because of previous errors."))
@@ -172,7 +204,9 @@ class CommandExecutor(private val scope: CoroutineScope) {
     }
 
     private fun watch(args: List<ByteArray>, client: ClientHandle) {
-        if (client.inMulti) { client.outgoing.trySend(RespValue.error("ERR WATCH inside MULTI is not allowed")); return }
+        if (client.inMulti) {
+            client.outgoing.trySend(RespValue.error("ERR WATCH inside MULTI is not allowed")); return
+        }
         for (i in 1 until args.size) {
             val key = args[i].toString(Charsets.UTF_8)
             watchers.getOrPut(key) { HashSet() }.add(client)
@@ -205,6 +239,20 @@ class CommandExecutor(private val scope: CoroutineScope) {
 
     suspend fun disconnect(client: ClientHandle) {
         mailbox.send { pubsub.removeClient(client); clearWatches(client) }
+    }
+
+    suspend fun loadAof() {
+        if (aof == null) return
+        loading = true
+        try {
+            for (cmd in aof.loadCommands()) {
+                val name = cmd[0].toString(Charsets.UTF_8).uppercase()
+                dispatchOnly(name, cmd)
+            }
+            println("AOF loaded: replayed commands")
+        } finally {
+            loading = false
+        }
     }
 
     companion object {

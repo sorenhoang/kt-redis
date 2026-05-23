@@ -2,17 +2,24 @@ package io.ktredis.server
 
 import io.ktor.network.selector.*
 import io.ktor.network.sockets.*
+import io.ktredis.persistence.Aof
+import io.ktredis.persistence.FsyncPolicy
 import io.ktredis.protocol.*
 import kotlinx.coroutines.*
+import java.io.File
 
 class RedisServer(
     private val host: String = "127.0.0.1",
     private val port: Int = 6379
 ) {
     suspend fun start() = coroutineScope{
-        val executor = CommandExecutor(this)
         val selector = SelectorManager(Dispatchers.IO)
         var serverSocket = aSocket(selector).tcp().bind(host, port)
+
+        val aof = Aof(File("appendonly.aof"), FsyncPolicy.EVERYSEC)
+        val executor = CommandExecutor(this, aof)
+        executor.loadAof()                          //
+
         println("kt-redis is listening on $host:$port")
 
         while (true) {
