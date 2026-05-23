@@ -94,7 +94,15 @@ class RdbReader(private val ins: InputStream) {
 object Rdb {
     /** Snapshot toàn bộ keyspace ra file dump.rdb. */
     fun save(db: RedisDatabase, file: File) {
-        BufferedOutputStream(FileOutputStream(file)).use { os ->
+        BufferedOutputStream(FileOutputStream(file)).use { os -> write(db, os) }
+    }
+
+    /** Serialize keyspace ra mảng byte (dùng cho PSYNC: master truyền RDB qua socket). */
+    fun dumpToBytes(db: RedisDatabase): ByteArray =
+        ByteArrayOutputStream().also { write(db, it) }.toByteArray()
+
+    private fun write(db: RedisDatabase, os: OutputStream) {
+        run {
             val w = RdbWriter(os)
             os.write("REDIS0011".toByteArray(Charsets.US_ASCII))
             w.byte(Op.SELECTDB); w.writeLength(0)
@@ -131,34 +139,37 @@ object Rdb {
         }
     }
 
-    /** Đọc dump.rdb -> danh sách (key, value, expireAt-tuyệt-đối). expireAt null nếu không có TTL. */
+    /** Đọc dump.rdb từ file -> danh sách (key, value, expireAt-tuyệt-đối). expireAt null nếu không có TTL. */
     fun load(file: File): List<Triple<String, RedisObject, Long?>> {
         if (!file.exists() || file.length() == 0L) return emptyList()
-        return BufferedInputStream(FileInputStream(file)).use { ins ->
-            val r = RdbReader(ins)
-            readHeader(ins)
-            val result = ArrayList<Triple<String, RedisObject, Long?>>()
-            var pendingExpire: Long? = null
-            loop@ while (true) {
-                when (val op = r.readByte()) {
-                    Op.EOF -> break@loop
-                    Op.SELECTDB -> r.readLength()
-                    Op.RESIZEDB -> { r.readLength(); r.readLength() }
-                    Op.AUX -> { r.readString(); r.readString() }
-                    Op.EXPIRE_MS -> pendingExpire = r.readLongLE()
-                    Op.EXPIRE_SEC -> {
-                        var v = 0L; for (i in 0 until 4) v = v or (r.readByte().toLong() shl (i * 8))
-                        pendingExpire = v * 1000
-                    }
-                    else -> {                                  // op chính là type byte
-                        val key = r.readKey()
-                        val value = readValue(op, r)
-                        result.add(Triple(key, value, pendingExpire)); pendingExpire = null
-                    }
+        return BufferedInputStream(FileInputStream(file)).use { load(it) }
+    }
+
+    /** Đọc RDB từ một InputStream bất kỳ (dùng cho replica nhận RDB qua socket). */
+    fun load(input: InputStream): List<Triple<String, RedisObject, Long?>> {
+        val r = RdbReader(input)
+        readHeader(input)
+        val result = ArrayList<Triple<String, RedisObject, Long?>>()
+        var pendingExpire: Long? = null
+        loop@ while (true) {
+            when (val op = r.readByte()) {
+                Op.EOF -> break@loop
+                Op.SELECTDB -> r.readLength()
+                Op.RESIZEDB -> { r.readLength(); r.readLength() }
+                Op.AUX -> { r.readString(); r.readString() }
+                Op.EXPIRE_MS -> pendingExpire = r.readLongLE()
+                Op.EXPIRE_SEC -> {
+                    var v = 0L; for (i in 0 until 4) v = v or (r.readByte().toLong() shl (i * 8))
+                    pendingExpire = v * 1000
+                }
+                else -> {                                  // op chính là type byte
+                    val key = r.readKey()
+                    val value = readValue(op, r)
+                    result.add(Triple(key, value, pendingExpire)); pendingExpire = null
                 }
             }
-            result
         }
+        return result
     }
 
     private fun readHeader(ins: InputStream) {

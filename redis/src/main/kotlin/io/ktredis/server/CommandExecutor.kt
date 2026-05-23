@@ -4,8 +4,10 @@ import io.ktredis.command.CommandDispatcher
 import io.ktredis.persistence.Aof
 import io.ktredis.persistence.FsyncPolicy
 import io.ktredis.persistence.Rdb
+import io.ktredis.protocol.Resp
 import io.ktredis.protocol.RespValue
 import io.ktredis.storage.RedisDatabase
+import io.ktredis.storage.RedisObject
 import kotlinx.coroutines.*
 import kotlinx.coroutines.channels.Channel
 import java.io.File
@@ -13,7 +15,8 @@ import java.io.File
 class CommandExecutor(
     private val scope: CoroutineScope,
     private val aof: Aof? = null,
-    private val rdbPath: String = "dump.rdb"
+    private val rdbPath: String = "dump.rdb",
+    private val myPort: Int = 6379
 ) {
     private var loading = false
     private val db = RedisDatabase()
@@ -22,6 +25,7 @@ class CommandExecutor(
     private val mailbox = Channel<() -> Unit>(Channel.UNLIMITED)
     private val pubsub = PubSub()
     private val watchers = HashMap<String, MutableSet<ClientHandle>>()   // key -> client đang WATCH
+    private val repl = ReplicationState()                                // trạng thái replication
 
     init {
         // single-writer: chạy mọi task tuần tự
@@ -89,6 +93,26 @@ class CommandExecutor(
             "BGSAVE" -> {
                 saveRdb(); client.outgoing.trySend(RespValue.SimpleString("Background saving started")); return
             }
+
+            "REPLCONF" -> {
+                handleReplconf(args, client); return
+            }
+
+            "PSYNC" -> {
+                handlePsync(client); return
+            }
+
+            "INFO" -> {
+                client.outgoing.trySend(RespValue.bulk(infoReplication())); return
+            }
+
+            "WAIT" -> {
+                client.outgoing.trySend(RespValue.int(repl.replicas.size.toLong())); return
+            }
+
+            "REPLICAOF", "SLAVEOF" -> {
+                handleReplicaOf(args, client); return
+            }
         }
         // đang trong MULTI -> xếp hàng (các lệnh điều khiển ở trên đã được xử lý)
         if (client.inMulti) {
@@ -99,6 +123,11 @@ class CommandExecutor(
         // lệnh thường
         if (name in PUBSUB_COMMANDS) {
             handlePubSub(name, args, client)                  // tự đẩy ack/message/count vào outgoing
+            return
+        }
+        // replica chỉ đọc: từ chối lệnh ghi đến từ client thường (lệnh từ master đi đường applyReplicated)
+        if (repl.role == Role.REPLICA && name in WRITE_COMMANDS) {
+            client.outgoing.trySend(RespValue.error("READONLY You can't write against a read only replica."))
             return
         }
         client.outgoing.trySend(dispatchOnly(name, args))     // mọi reply đều đi qua outgoing
@@ -116,7 +145,10 @@ class CommandExecutor(
 
         if (name in WRITE_COMMANDS) {
             touchKey(args)
-            if (!loading && aof != null && result !is RespValue.Error) aof.append(args)
+            if (!loading && result !is RespValue.Error) {
+                aof?.append(args)                              // bền vững cục bộ
+                if (repl.role == Role.MASTER) propagate(args)  // truyền xuống các replica
+            }
         }
         return result
     }
@@ -249,7 +281,97 @@ class CommandExecutor(
     }
 
     suspend fun disconnect(client: ClientHandle) {
-        mailbox.send { pubsub.removeClient(client); clearWatches(client) }
+        mailbox.send { pubsub.removeClient(client); clearWatches(client); repl.replicas.remove(client) }
+    }
+
+    // ---------- replication: master ----------
+    /** Đẩy một lệnh ghi xuống mọi replica + tăng offset. Chạy trên writer thread nên thứ tự đảm bảo. */
+    private fun propagate(args: List<ByteArray>) {
+        val frame = RespValue.Array(args.map { RespValue.bulk(it) })
+        repl.masterReplOffset += Resp.encode(frame).size
+        for (r in repl.replicas) r.outgoing.trySend(frame)
+    }
+
+    private fun handleReplconf(args: List<ByteArray>, client: ClientHandle) {
+        val sub = if (args.size > 1) args[1].toString(Charsets.UTF_8).uppercase() else ""
+        if (sub == "LISTENING-PORT" && args.size > 2)
+            client.replListeningPort = args[2].toString(Charsets.UTF_8).toIntOrNull()
+        // GETACK/capa... -> chỉ cần ack
+        client.outgoing.trySend(RespValue.OK)
+    }
+
+    /** PSYNC ? -1: gửi FULLRESYNC + RDB snapshot, rồi đăng ký connection này làm replica. */
+    private fun handlePsync(client: ClientHandle) {
+        client.outgoing.trySend(RespValue.SimpleString("FULLRESYNC ${repl.replId} ${repl.masterReplOffset}"))
+        val rdb = Rdb.dumpToBytes(db)
+        val header = "\$${rdb.size}\r\n".toByteArray()
+        client.outgoing.trySend(RespValue.Raw(header + rdb))   // $<len>\r\n<bytes> (không CRLF cuối)
+        client.isReplica = true
+        repl.replicas.add(client)
+        println("replica synced (listening-port=${client.replListeningPort}), sent RDB ${rdb.size} bytes")
+    }
+
+    private fun infoReplication(): String = buildString {
+        append("# Replication\r\n")
+        if (repl.role == Role.MASTER) {
+            append("role:master\r\n")
+            append("connected_slaves:${repl.replicas.size}\r\n")
+            repl.replicas.forEachIndexed { i, c ->
+                append("slave$i:ip=127.0.0.1,port=${c.replListeningPort ?: 0},state=online,offset=${repl.masterReplOffset},lag=0\r\n")
+            }
+        } else {
+            append("role:slave\r\n")
+            append("master_host:${repl.masterHost}\r\n")
+            append("master_port:${repl.masterPort}\r\n")
+            append("master_link_status:${if (repl.linkUp) "up" else "down"}\r\n")
+        }
+        append("master_replid:${repl.replId}\r\n")
+        append("master_repl_offset:${repl.masterReplOffset}\r\n")
+    }
+
+    /** REPLICAOF NO ONE -> thành master; REPLICAOF host port -> thành replica và kết nối master. */
+    private fun handleReplicaOf(args: List<ByteArray>, client: ClientHandle) {
+        if (args.size < 3) { client.outgoing.trySend(RespValue.error("ERR wrong number of arguments for 'replicaof'")); return }
+        val host = args[1].toString(Charsets.UTF_8)
+        val port = args[2].toString(Charsets.UTF_8)
+        if (host.equals("no", true) && port.equals("one", true)) {
+            repl.role = Role.MASTER; repl.masterHost = null; repl.linkUp = false
+            client.outgoing.trySend(RespValue.OK)
+            return
+        }
+        val p = port.toIntOrNull()
+        if (p == null) { client.outgoing.trySend(RespValue.error("ERR Invalid master port")); return }
+        becomeReplica(host, p)
+        ReplicaLink(host, p, myPort, this, scope).start()
+        client.outgoing.trySend(RespValue.OK)
+    }
+
+    // ---------- replication: replica ----------
+    fun becomeReplica(host: String, port: Int) {
+        repl.role = Role.REPLICA; repl.masterHost = host; repl.masterPort = port; repl.linkUp = false
+    }
+
+    fun setLinkUp(up: Boolean) { repl.linkUp = up }
+
+    /** Thay toàn bộ keyspace bằng snapshot RDB nhận từ master (full resync). */
+    suspend fun installSnapshot(entries: List<Triple<String, RedisObject, Long?>>) {
+        mailbox.send {
+            db.clear()
+            val now = System.currentTimeMillis()
+            for ((k, v, exp) in entries) {
+                if (exp != null && exp <= now) continue
+                db.restore(k, v, exp)
+            }
+        }
+    }
+
+    /** Áp dụng một lệnh do master truyền xuống (bỏ qua read-only guard, không re-propagate vì không có sub-replica). */
+    suspend fun applyReplicated(args: List<ByteArray>) {
+        val name = args[0].toString(Charsets.UTF_8).uppercase()
+        mailbox.send {
+            dispatchOnly(name, args)
+            repl.masterReplOffset += Resp.encode(RespValue.Array(args.map { RespValue.bulk(it) })).size
+        }
     }
 
     suspend fun loadAof() {

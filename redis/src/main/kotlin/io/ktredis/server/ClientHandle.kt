@@ -15,4 +15,8 @@ class ClientHandle{
     var txError = false
     val watchedKeys = HashSet<String>()
     var dirty = false
+
+    // --- replication ---
+    var isReplica = false                 // connection này đã PSYNC -> là một replica
+    var replListeningPort: Int? = null    // cổng replica báo qua REPLCONF listening-port
 }

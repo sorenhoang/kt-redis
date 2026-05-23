@@ -9,6 +9,7 @@ sealed interface RespValue{
     data class Integer(val value: Long) : RespValue
     data class BulkString(val data: ByteArray?) : RespValue   // null = $-1
     data class Array(val items: List<RespValue>?) : RespValue // null = *-1
+    data class Raw(val bytes: ByteArray) : RespValue          // bytes thô, ghi nguyên xi (dùng cho khung RDB của PSYNC)
 
     companion object {
         val OK = SimpleString("OK")
@@ -28,6 +29,7 @@ object Resp{
         is RespValue.Integer      -> ":${value.value}\r\n".toByteArray()
         is RespValue.BulkString   -> encodeBulk(value.data)
         is RespValue.Array        -> encodeArray(value.items)
+        is RespValue.Raw          -> value.bytes
     }
 
     private fun encodeBulk(data: ByteArray?): ByteArray {
