@@ -16,9 +16,13 @@ class RedisServer(
         val selector = SelectorManager(Dispatchers.IO)
         var serverSocket = aSocket(selector).tcp().bind(host, port)
 
-        val aof = Aof(File("appendonly.aof"), FsyncPolicy.EVERYSEC)
+        val aofFile = File("appendonly.aof")
+        val hadAof = aofFile.exists() && aofFile.length() > 0     // quyết định TRƯỚC khi Aof tạo file rỗng
+        val aof = Aof(aofFile, FsyncPolicy.EVERYSEC)
         val executor = CommandExecutor(this, aof)
-        executor.loadAof()                          //
+
+        if (hadAof) executor.loadAof()              // ưu tiên AOF nếu có dữ liệu
+        else executor.loadRdb()                     // ngược lại nạp dump.rdb (nếu tồn tại)
 
         println("kt-redis is listening on $host:$port")
 

@@ -3,14 +3,17 @@ package io.ktredis.server
 import io.ktredis.command.CommandDispatcher
 import io.ktredis.persistence.Aof
 import io.ktredis.persistence.FsyncPolicy
+import io.ktredis.persistence.Rdb
 import io.ktredis.protocol.RespValue
 import io.ktredis.storage.RedisDatabase
 import kotlinx.coroutines.*
 import kotlinx.coroutines.channels.Channel
+import java.io.File
 
 class CommandExecutor(
     private val scope: CoroutineScope,
-    private val aof: Aof? = null
+    private val aof: Aof? = null,
+    private val rdbPath: String = "dump.rdb"
 ) {
     private var loading = false
     private val db = RedisDatabase()
@@ -24,12 +27,12 @@ class CommandExecutor(
         // single-writer: chạy mọi task tuần tự
         scope.launch {
             for (task in mailbox) task()
-
-            if (aof != null && aof.policy == FsyncPolicy.EVERYSEC) {
-                scope.launch {
-                    while (isActive) {
-                        delay(1000); mailbox.send { aof.fsync() }
-                    }
+        }
+        // fsync nền cho chính sách everysec (đẩy qua mailbox -> luôn chạy trên writer thread)
+        if (aof != null && aof.policy == FsyncPolicy.EVERYSEC) {
+            scope.launch {
+                while (isActive) {
+                    delay(1000); mailbox.send { aof.fsync() }
                 }
             }
         }
@@ -77,6 +80,14 @@ class CommandExecutor(
 
             "UNWATCH" -> {
                 unwatch(client); return
+            }
+
+            "SAVE" -> {
+                saveRdb(); client.outgoing.trySend(RespValue.OK); return
+            }
+
+            "BGSAVE" -> {
+                saveRdb(); client.outgoing.trySend(RespValue.SimpleString("Background saving started")); return
             }
         }
         // đang trong MULTI -> xếp hàng (các lệnh điều khiển ở trên đã được xử lý)
@@ -253,6 +264,21 @@ class CommandExecutor(
         } finally {
             loading = false
         }
+    }
+
+    /** Snapshot toàn bộ keyspace ra dump.rdb (chạy trên writer thread -> nhất quán). */
+    private fun saveRdb() = Rdb.save(db, File(rdbPath))
+
+    /** Nạp dump.rdb lúc khởi động; bỏ qua key đã hết hạn. Không kích hoạt AOF append (nạp thẳng vào db). */
+    fun loadRdb() {
+        val now = System.currentTimeMillis()
+        var count = 0
+        for ((key, value, expireAt) in Rdb.load(File(rdbPath))) {
+            if (expireAt != null && expireAt <= now) continue
+            db.restore(key, value, expireAt)
+            count++
+        }
+        if (count > 0) println("RDB loaded: $count keys")
     }
 
     companion object {

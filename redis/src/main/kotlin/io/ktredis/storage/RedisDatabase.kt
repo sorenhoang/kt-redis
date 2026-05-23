@@ -98,4 +98,16 @@ class RedisDatabase(private val clock: Clock = SystemClock){
             }
         }
     }
+
+    fun expireAt(key: String): Long? = expires[key]
+
+    fun restore(key: String, value: RedisObject, expireAtMillis: Long?) {
+        map[key] = value
+        if (expireAtMillis != null) expires[key] = expireAtMillis else expires.remove(key)
+    }
+
+    fun allEntries(): Map<String, RedisObject> {
+        map.keys.toList().forEach { expireIfNeeded(it) }
+        return map.toMap()
+    }
 }
