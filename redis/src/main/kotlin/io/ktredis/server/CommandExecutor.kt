@@ -1,5 +1,8 @@
 package io.ktredis.server
 
+import io.ktredis.cluster.ClusterGossip
+import io.ktredis.cluster.ClusterState
+import io.ktredis.cluster.Crc16
 import io.ktredis.command.CommandDispatcher
 import io.ktredis.persistence.Aof
 import io.ktredis.persistence.FsyncPolicy
@@ -16,7 +19,9 @@ class CommandExecutor(
     private val scope: CoroutineScope,
     private val aof: Aof? = null,
     private val rdbPath: String = "dump.rdb",
-    private val myPort: Int = 6379
+    private val myPort: Int = 6379,
+    private val clusterEnabled: Boolean = false,
+    private val myHost: String = "127.0.0.1"
 ) {
     private var loading = false
     private val db = RedisDatabase()
@@ -26,6 +31,8 @@ class CommandExecutor(
     private val pubsub = PubSub()
     private val watchers = HashMap<String, MutableSet<ClientHandle>>()   // key -> client đang WATCH
     private val repl = ReplicationState()                                // trạng thái replication
+    private val cluster: ClusterState? = if (clusterEnabled) ClusterState(myHost, myPort) else null
+    private val gossip: ClusterGossip? = cluster?.let { ClusterGossip(it, scope) }
 
     init {
         // single-writer: chạy mọi task tuần tự
@@ -47,6 +54,8 @@ class CommandExecutor(
                 mailbox.send { db.activeExpireCycle() }
             }
         }
+        // cluster: gossip định kỳ với các peer
+        gossip?.startPeriodic()
     }
 
     suspend fun execute(args: List<ByteArray>, client: ClientHandle) {
@@ -113,6 +122,10 @@ class CommandExecutor(
             "REPLICAOF", "SLAVEOF" -> {
                 handleReplicaOf(args, client); return
             }
+
+            "CLUSTER" -> {
+                handleCluster(args, client); return
+            }
         }
         // đang trong MULTI -> xếp hàng (các lệnh điều khiển ở trên đã được xử lý)
         if (client.inMulti) {
@@ -125,12 +138,59 @@ class CommandExecutor(
             handlePubSub(name, args, client)                  // tự đẩy ack/message/count vào outgoing
             return
         }
+        // cluster: nếu key không thuộc slot của node này -> trả MOVED để client tự chuyển hướng
+        if (cluster != null) {
+            val redirect = clusterRedirect(name, args)
+            if (redirect != null) { client.outgoing.trySend(redirect); return }
+        }
         // replica chỉ đọc: từ chối lệnh ghi đến từ client thường (lệnh từ master đi đường applyReplicated)
         if (repl.role == Role.REPLICA && name in WRITE_COMMANDS) {
             client.outgoing.trySend(RespValue.error("READONLY You can't write against a read only replica."))
             return
         }
         client.outgoing.trySend(dispatchOnly(name, args))     // mọi reply đều đi qua outgoing
+    }
+
+    // ---------- cluster ----------
+    /** Trả về reply MOVED/CLUSTERDOWN nếu key của lệnh không do node này phục vụ; null nếu phục vụ được. */
+    private fun clusterRedirect(name: String, args: List<ByteArray>): RespValue? {
+        val c = cluster ?: return null
+        if (name in KEYLESS_COMMANDS || args.size < 2) return null
+        val slot = Crc16.keyHashSlot(args[1].toString(Charsets.UTF_8))
+        val owner = c.ownerOf(slot) ?: return RespValue.error("CLUSTERDOWN Hash slot not served")
+        if (owner.id == c.myId) return null
+        return RespValue.error("MOVED $slot ${owner.ip}:${owner.port}")
+    }
+
+    private fun handleCluster(args: List<ByteArray>, client: ClientHandle) {
+        val c = cluster
+        if (c == null) {
+            client.outgoing.trySend(RespValue.error("ERR This instance has cluster support disabled")); return
+        }
+        fun s(i: Int) = args[i].toString(Charsets.UTF_8)
+        val sub = if (args.size > 1) s(1).uppercase() else ""
+        val reply: RespValue = when (sub) {
+            "MYID"     -> RespValue.bulk(c.myId)
+            "INFO"     -> RespValue.bulk(c.info())
+            "NODES"    -> RespValue.bulk(c.nodesText())
+            "SLOTS"    -> c.slotsReply()
+            "SHARDS"   -> RespValue.Array(emptyList())
+            "KEYSLOT"  -> if (args.size > 2) RespValue.int(Crc16.keyHashSlot(s(2)).toLong())
+                          else RespValue.error("ERR wrong number of arguments for 'cluster|keyslot'")
+            "ADDSLOTS" -> {
+                val slots = (2 until args.size).mapNotNull { s(it).toIntOrNull() }
+                c.addSlots(slots); RespValue.OK
+            }
+            "MEET"     -> {
+                val mport = if (args.size > 3) s(3).toIntOrNull() else null
+                if (mport != null) { gossip?.meetAsync(s(2), mport); RespValue.OK }
+                else RespValue.error("ERR Invalid arguments for 'cluster|meet'")
+            }
+            "GOSSIP"   -> { if (args.size > 2) c.mergeFrom(s(2)); RespValue.bulk(c.serialize()) }
+            "RESET"    -> { c.reset(); RespValue.OK }
+            else       -> RespValue.error("ERR Unknown CLUSTER subcommand or wrong number of arguments for '$sub'")
+        }
+        client.outgoing.trySend(reply)
     }
 
     private fun dispatchOnly(name: String, args: List<ByteArray>): RespValue {
@@ -413,6 +473,14 @@ class CommandExecutor(
             "HSET", "HDEL", "HINCRBY",
             "SADD", "SREM", "SPOP", "SINTERSTORE", "SUNIONSTORE", "SDIFFSTORE",
             "ZADD", "ZREM", "ZINCRBY"
+        )
+        // lệnh không gắn với 1 key cụ thể ở args[1] -> bỏ qua kiểm tra slot/MOVED
+        private val KEYLESS_COMMANDS = setOf(
+            "PING", "ECHO", "CLUSTER", "INFO", "COMMAND", "SELECT", "AUTH", "HELLO", "CLIENT",
+            "MULTI", "EXEC", "DISCARD", "WATCH", "UNWATCH",
+            "SUBSCRIBE", "UNSUBSCRIBE", "PSUBSCRIBE", "PUNSUBSCRIBE", "PUBLISH",
+            "SAVE", "BGSAVE", "REPLCONF", "PSYNC", "REPLICAOF", "SLAVEOF", "WAIT",
+            "KEYS", "SCAN", "DBSIZE", "FLUSHDB", "FLUSHALL"
         )
     }
 }

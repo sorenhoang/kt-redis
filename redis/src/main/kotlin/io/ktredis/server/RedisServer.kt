@@ -11,7 +11,8 @@ import java.io.File
 class RedisServer(
     private val host: String = "127.0.0.1",
     private val port: Int = 6379,
-    private val replicaOf: Pair<String, Int>? = null    // (masterHost, masterPort) nếu chạy như replica
+    private val replicaOf: Pair<String, Int>? = null,   // (masterHost, masterPort) nếu chạy như replica
+    private val clusterEnabled: Boolean = false
 ) {
     suspend fun start() = coroutineScope{
         val selector = SelectorManager(Dispatchers.IO)
@@ -20,7 +21,7 @@ class RedisServer(
         val aofFile = File("appendonly.aof")
         val hadAof = aofFile.exists() && aofFile.length() > 0     // quyết định TRƯỚC khi Aof tạo file rỗng
         val aof = Aof(aofFile, FsyncPolicy.EVERYSEC)
-        val executor = CommandExecutor(this, aof, myPort = port)
+        val executor = CommandExecutor(this, aof, myPort = port, clusterEnabled = clusterEnabled, myHost = host)
 
         if (hadAof) executor.loadAof()              // ưu tiên AOF nếu có dữ liệu
         else executor.loadRdb()                     // ngược lại nạp dump.rdb (nếu tồn tại)
