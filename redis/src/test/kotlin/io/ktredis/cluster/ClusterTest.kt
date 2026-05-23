@@ -8,26 +8,26 @@ import kotlin.test.assertTrue
 class ClusterTest {
 
     @Test fun `CRC16-XMODEM check value`() {
-        // giá trị kiểm tra chuẩn của CRC-16/XMODEM cho "123456789"
+        // standard check value of CRC-16/XMODEM for "123456789"
         assertEquals(0x31C3, Crc16.crc16("123456789".toByteArray()))
     }
 
     @Test fun `slot nam trong 0 den 16383`() {
         for (k in listOf("foo", "bar", "user:1", "abc{def}", "x")) {
             val slot = Crc16.keyHashSlot(k)
-            assertTrue(slot in 0 until 16384, "slot $slot ngoài khoảng")
+            assertTrue(slot in 0 until 16384, "slot $slot out of range")
         }
     }
 
     @Test fun `hash tag chi hash phan trong ngoac`() {
-        // chỉ phần trong {} được hash -> hai key cùng tag về cùng slot
+        // only the part inside {} is hashed -> two keys with the same tag map to the same slot
         assertEquals(
             Crc16.keyHashSlot("{user1000}.following"),
             Crc16.keyHashSlot("{user1000}.followers")
         )
-        // key có tag = hash của riêng nội dung tag
+        // key with tag = hash of the tag content only
         assertEquals(Crc16.crc16("abc".toByteArray()) % 16384, Crc16.keyHashSlot("{abc}.whatever"))
-        // tag rỗng {} -> hash TOÀN BỘ key (không phải chuỗi rỗng)
+        // empty tag {} -> hash the ENTIRE key (not an empty string)
         assertEquals(Crc16.crc16("{}.x".toByteArray()) % 16384, Crc16.keyHashSlot("{}.x"))
     }
 
@@ -44,9 +44,9 @@ class ClusterTest {
         a.addSlots((0..100).toList())
 
         val b = ClusterState("127.0.0.1", 7002)
-        b.mergeFrom(a.serialize())                       // b học được a + slot a sở hữu
+        b.mergeFrom(a.serialize())                       // b learns about a and the slots a owns
 
-        // b giờ biết node a và slot 50 thuộc a
+        // b now knows about node a and that slot 50 belongs to a
         assertTrue(b.nodes.containsKey(a.myId))
         assertEquals(a.myId, b.ownerOf(50)?.id)
         assertEquals(false, b.isMine(50))

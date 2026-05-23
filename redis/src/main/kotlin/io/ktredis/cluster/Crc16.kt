@@ -1,7 +1,7 @@
 package io.ktredis.cluster
 
 /**
- * CRC16-CCITT (XMODEM): poly 0x1021, init 0x0000, không reflect — đúng bản Redis dùng cho hash slot.
+ * CRC16-CCITT (XMODEM): poly 0x1021, init 0x0000, no reflection — matches the variant Redis uses for hash slots.
  * Check value: CRC16("123456789") == 0x31C3.
  */
 object Crc16 {
@@ -25,12 +25,12 @@ object Crc16 {
         return crc
     }
 
-    /** slot của key, có xử lý hash tag {...}: nếu có {tag} không rỗng thì chỉ hash phần trong ngoặc. */
+    /** Hash slot for a key, with hash tag support: if a non-empty {tag} exists, only the content inside braces is hashed. */
     fun keyHashSlot(key: String): Int {
         val s = key.indexOf('{')
         if (s >= 0) {
             val e = key.indexOf('}', s + 1)
-            if (e > s + 1) {                                   // có nội dung không rỗng giữa { và }
+            if (e > s + 1) {                                   // non-empty content between { and }
                 return crc16(key.substring(s + 1, e).toByteArray(Charsets.UTF_8)) % SLOTS
             }
         }

@@ -18,7 +18,7 @@ class SortedSetCommandsTest {
         assertEquals(RespValue.int(2), d.dispatch(cmd("ZADD", "lb", "100", "an", "90", "bo")))
         val arr = (d.dispatch(cmd("ZRANGE", "lb", "0", "-1", "WITHSCORES")) as RespValue.Array)
             .items!!.map { str(it) }
-        assertEquals(listOf("bo", "90", "an", "100"), arr)   // sắp tăng theo score
+        assertEquals(listOf("bo", "90", "an", "100"), arr)   // ascending by score
     }
 
     @Test fun `zrank`() {

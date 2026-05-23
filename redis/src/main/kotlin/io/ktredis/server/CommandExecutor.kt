@@ -29,17 +29,17 @@ class CommandExecutor(
     private val blocking = BlockingManager(db)
     private val mailbox = Channel<() -> Unit>(Channel.UNLIMITED)
     private val pubsub = PubSub()
-    private val watchers = HashMap<String, MutableSet<ClientHandle>>()   // key -> client đang WATCH
-    private val repl = ReplicationState()                                // trạng thái replication
+    private val watchers = HashMap<String, MutableSet<ClientHandle>>()   // key -> clients WATCHing this key
+    private val repl = ReplicationState()                                // replication state
     private val cluster: ClusterState? = if (clusterEnabled) ClusterState(myHost, myPort) else null
     private val gossip: ClusterGossip? = cluster?.let { ClusterGossip(it, scope) }
 
     init {
-        // single-writer: chạy mọi task tuần tự
+        // single-writer: runs all tasks sequentially
         scope.launch {
             for (task in mailbox) task()
         }
-        // fsync nền cho chính sách everysec (đẩy qua mailbox -> luôn chạy trên writer thread)
+        // background fsync for everysec policy (dispatched through mailbox -> always runs on the writer thread)
         if (aof != null && aof.policy == FsyncPolicy.EVERYSEC) {
             scope.launch {
                 while (isActive) {
@@ -54,7 +54,7 @@ class CommandExecutor(
                 mailbox.send { db.activeExpireCycle() }
             }
         }
-        // cluster: gossip định kỳ với các peer
+        // cluster: periodic gossip with peers
         gossip?.startPeriodic()
     }
 
@@ -64,7 +64,7 @@ class CommandExecutor(
         }
         val name = args[0].toString(Charsets.UTF_8).uppercase()
 
-        // BLPOP/BRPOP: chờ (suspend) ngay tại connection coroutine, rồi đẩy kết quả ra outgoing
+        // BLPOP/BRPOP: suspend directly in the connection coroutine, then push the result to outgoing
         if (name == "BLPOP" || name == "BRPOP") {
             client.outgoing.trySend(executeBlocking(args, fromHead = name == "BLPOP"))
             return
@@ -127,32 +127,32 @@ class CommandExecutor(
                 handleCluster(args, client); return
             }
         }
-        // đang trong MULTI -> xếp hàng (các lệnh điều khiển ở trên đã được xử lý)
+        // inside MULTI -> queue the command (control commands above are already handled)
         if (client.inMulti) {
             client.queued.add(args)
             client.outgoing.trySend(RespValue.SimpleString("QUEUED"))
             return
         }
-        // lệnh thường
+        // regular command
         if (name in PUBSUB_COMMANDS) {
-            handlePubSub(name, args, client)                  // tự đẩy ack/message/count vào outgoing
+            handlePubSub(name, args, client)                  // pushes ack/message/count into outgoing
             return
         }
-        // cluster: nếu key không thuộc slot của node này -> trả MOVED để client tự chuyển hướng
+        // cluster: if the key's slot is not owned by this node -> reply MOVED so the client redirects
         if (cluster != null) {
             val redirect = clusterRedirect(name, args)
             if (redirect != null) { client.outgoing.trySend(redirect); return }
         }
-        // replica chỉ đọc: từ chối lệnh ghi đến từ client thường (lệnh từ master đi đường applyReplicated)
+        // read-only replica: reject write commands from regular clients (master writes go through applyReplicated)
         if (repl.role == Role.REPLICA && name in WRITE_COMMANDS) {
             client.outgoing.trySend(RespValue.error("READONLY You can't write against a read only replica."))
             return
         }
-        client.outgoing.trySend(dispatchOnly(name, args))     // mọi reply đều đi qua outgoing
+        client.outgoing.trySend(dispatchOnly(name, args))     // all replies go through outgoing
     }
 
     // ---------- cluster ----------
-    /** Trả về reply MOVED/CLUSTERDOWN nếu key của lệnh không do node này phục vụ; null nếu phục vụ được. */
+    /** Returns a MOVED/CLUSTERDOWN reply if the command's key is not served by this node; null if it is. */
     private fun clusterRedirect(name: String, args: List<ByteArray>): RespValue? {
         val c = cluster ?: return null
         if (name in KEYLESS_COMMANDS || args.size < 2) return null
@@ -206,8 +206,8 @@ class CommandExecutor(
         if (name in WRITE_COMMANDS) {
             touchKey(args)
             if (!loading && result !is RespValue.Error) {
-                aof?.append(args)                              // bền vững cục bộ
-                if (repl.role == Role.MASTER) propagate(args)  // truyền xuống các replica
+                aof?.append(args)                              // local durability
+                if (repl.role == Role.MASTER) propagate(args)  // propagate to replicas
             }
         }
         return result
@@ -224,7 +224,7 @@ class CommandExecutor(
         val waiter = BlockingManager.Waiter(keys, fromHead, deferred)
         mailbox.send { blocking.tryPopOrRegister(waiter) }
 
-        // hẹn giờ timeout (0 = chờ vô hạn). Task timeout cũng đi qua mailbox -> không tranh chấp.
+        // schedule timeout (0 = wait indefinitely). Timeout task also goes through mailbox -> no contention.
         val timeoutJob = if (timeoutSec > 0) scope.launch {
             delay((timeoutSec * 1000).toLong())
             mailbox.send { blocking.timeout(waiter) }
@@ -233,7 +233,7 @@ class CommandExecutor(
         val result = deferred.await()
         timeoutJob?.cancel()
 
-        return if (result == null) RespValue.Array(null)        // hết giờ -> nil array (*-1)
+        return if (result == null) RespValue.Array(null)        // timed out -> nil array (*-1)
         else RespValue.Array(listOf(RespValue.bulk(result.first), RespValue.bulk(result.second)))
     }
 
@@ -294,7 +294,7 @@ class CommandExecutor(
             client.outgoing.trySend(RespValue.error("EXECABORT Transaction discarded because of previous errors."))
             return
         }
-        if (client.dirty) {                                   // watched key đã đổi -> huỷ
+        if (client.dirty) {                                   // a watched key changed -> abort
             resetTx(client)
             client.outgoing.trySend(RespValue.Array(null))    // nil array
             return
@@ -303,7 +303,7 @@ class CommandExecutor(
             dispatchOnly(qargs[0].toString(Charsets.UTF_8).uppercase(), qargs)
         }
         resetTx(client)
-        client.outgoing.trySend(RespValue.Array(results))     // chạy nguyên khối -> atomic
+        client.outgoing.trySend(RespValue.Array(results))     // executed as a block -> atomic
     }
 
     private fun watch(args: List<ByteArray>, client: ClientHandle) {
@@ -323,7 +323,7 @@ class CommandExecutor(
         client.outgoing.trySend(RespValue.OK)
     }
 
-    /** Sau mỗi lệnh ghi: đánh dấu dirty cho client đang WATCH key này. */
+    /** After each write command: marks dirty any client currently WATCHing this key. */
     private fun touchKey(args: List<ByteArray>) {
         if (args.size < 2) return
         val key = args[1].toString(Charsets.UTF_8)
@@ -345,7 +345,7 @@ class CommandExecutor(
     }
 
     // ---------- replication: master ----------
-    /** Đẩy một lệnh ghi xuống mọi replica + tăng offset. Chạy trên writer thread nên thứ tự đảm bảo. */
+    /** Propagates a write command to all replicas and increments the offset. Runs on the writer thread so ordering is guaranteed. */
     private fun propagate(args: List<ByteArray>) {
         val frame = RespValue.Array(args.map { RespValue.bulk(it) })
         repl.masterReplOffset += Resp.encode(frame).size
@@ -356,16 +356,16 @@ class CommandExecutor(
         val sub = if (args.size > 1) args[1].toString(Charsets.UTF_8).uppercase() else ""
         if (sub == "LISTENING-PORT" && args.size > 2)
             client.replListeningPort = args[2].toString(Charsets.UTF_8).toIntOrNull()
-        // GETACK/capa... -> chỉ cần ack
+        // GETACK/capa... -> just acknowledge
         client.outgoing.trySend(RespValue.OK)
     }
 
-    /** PSYNC ? -1: gửi FULLRESYNC + RDB snapshot, rồi đăng ký connection này làm replica. */
+    /** PSYNC ? -1: sends FULLRESYNC + RDB snapshot, then registers this connection as a replica. */
     private fun handlePsync(client: ClientHandle) {
         client.outgoing.trySend(RespValue.SimpleString("FULLRESYNC ${repl.replId} ${repl.masterReplOffset}"))
         val rdb = Rdb.dumpToBytes(db)
         val header = "\$${rdb.size}\r\n".toByteArray()
-        client.outgoing.trySend(RespValue.Raw(header + rdb))   // $<len>\r\n<bytes> (không CRLF cuối)
+        client.outgoing.trySend(RespValue.Raw(header + rdb))   // $<len>\r\n<bytes> (no trailing CRLF)
         client.isReplica = true
         repl.replicas.add(client)
         println("replica synced (listening-port=${client.replListeningPort}), sent RDB ${rdb.size} bytes")
@@ -389,7 +389,7 @@ class CommandExecutor(
         append("master_repl_offset:${repl.masterReplOffset}\r\n")
     }
 
-    /** REPLICAOF NO ONE -> thành master; REPLICAOF host port -> thành replica và kết nối master. */
+    /** REPLICAOF NO ONE -> become master; REPLICAOF host port -> become replica and connect to master. */
     private fun handleReplicaOf(args: List<ByteArray>, client: ClientHandle) {
         if (args.size < 3) { client.outgoing.trySend(RespValue.error("ERR wrong number of arguments for 'replicaof'")); return }
         val host = args[1].toString(Charsets.UTF_8)
@@ -413,7 +413,7 @@ class CommandExecutor(
 
     fun setLinkUp(up: Boolean) { repl.linkUp = up }
 
-    /** Thay toàn bộ keyspace bằng snapshot RDB nhận từ master (full resync). */
+    /** Replaces the entire keyspace with the RDB snapshot received from the master (full resync). */
     suspend fun installSnapshot(entries: List<Triple<String, RedisObject, Long?>>) {
         mailbox.send {
             db.clear()
@@ -425,7 +425,7 @@ class CommandExecutor(
         }
     }
 
-    /** Áp dụng một lệnh do master truyền xuống (bỏ qua read-only guard, không re-propagate vì không có sub-replica). */
+    /** Applies a command propagated by the master (bypasses read-only guard; does not re-propagate as there are no sub-replicas). */
     suspend fun applyReplicated(args: List<ByteArray>) {
         val name = args[0].toString(Charsets.UTF_8).uppercase()
         mailbox.send {
@@ -448,10 +448,10 @@ class CommandExecutor(
         }
     }
 
-    /** Snapshot toàn bộ keyspace ra dump.rdb (chạy trên writer thread -> nhất quán). */
+    /** Snapshots the entire keyspace to dump.rdb (runs on the writer thread -> consistent). */
     private fun saveRdb() = Rdb.save(db, File(rdbPath))
 
-    /** Nạp dump.rdb lúc khởi động; bỏ qua key đã hết hạn. Không kích hoạt AOF append (nạp thẳng vào db). */
+    /** Loads dump.rdb at startup; skips expired keys. Does not trigger AOF append (loads directly into db). */
     fun loadRdb() {
         val now = System.currentTimeMillis()
         var count = 0
@@ -474,7 +474,7 @@ class CommandExecutor(
             "SADD", "SREM", "SPOP", "SINTERSTORE", "SUNIONSTORE", "SDIFFSTORE",
             "ZADD", "ZREM", "ZINCRBY"
         )
-        // lệnh không gắn với 1 key cụ thể ở args[1] -> bỏ qua kiểm tra slot/MOVED
+        // commands not tied to a specific key at args[1] -> skip slot/MOVED check
         private val KEYLESS_COMMANDS = setOf(
             "PING", "ECHO", "CLUSTER", "INFO", "COMMAND", "SELECT", "AUTH", "HELLO", "CLIENT",
             "MULTI", "EXEC", "DISCARD", "WATCH", "UNWATCH",

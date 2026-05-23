@@ -32,7 +32,7 @@ class RdbTest {
         assertEquals("v1", String(h["f1"]!!))
         assertEquals("v2", String(h["f2"]!!))
 
-        // zset phải đúng thứ tự theo score: bo(90) trước an(100)
+        // zset must be in score order: bo(90) before an(100)
         assertEquals(
             listOf(90.0 to "bo", 100.0 to "an"),
             (loaded["zs"] as RedisObject.SortedSetValue).ascending()

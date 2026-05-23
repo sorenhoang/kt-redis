@@ -17,6 +17,6 @@ class ClientHandle{
     var dirty = false
 
     // --- replication ---
-    var isReplica = false                 // connection này đã PSYNC -> là một replica
-    var replListeningPort: Int? = null    // cổng replica báo qua REPLCONF listening-port
+    var isReplica = false                 // this connection has PSYNCed -> it is a replica
+    var replListeningPort: Int? = null    // replica port reported via REPLCONF listening-port
 }

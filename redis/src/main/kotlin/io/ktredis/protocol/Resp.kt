@@ -9,7 +9,7 @@ sealed interface RespValue{
     data class Integer(val value: Long) : RespValue
     data class BulkString(val data: ByteArray?) : RespValue   // null = $-1
     data class Array(val items: List<RespValue>?) : RespValue // null = *-1
-    data class Raw(val bytes: ByteArray) : RespValue          // bytes thô, ghi nguyên xi (dùng cho khung RDB của PSYNC)
+    data class Raw(val bytes: ByteArray) : RespValue          // raw bytes written as-is (used for the RDB frame in PSYNC)
 
     companion object {
         val OK = SimpleString("OK")

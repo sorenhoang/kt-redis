@@ -11,8 +11,9 @@ import kotlinx.coroutines.*
 import java.io.ByteArrayInputStream
 
 /**
- * Phía replica: kết nối master, bắt tay (PING -> REPLCONF -> PSYNC), nhận RDB full resync,
- * rồi áp dụng mọi lệnh ghi master truyền xuống. Tự thử kết nối lại khi rớt.
+ * Replica side: connects to master, performs handshake (PING -> REPLCONF -> PSYNC),
+ * receives full RDB resync, then applies all write commands propagated by master.
+ * Automatically reconnects on failure.
  */
 class ReplicaLink(
     private val masterHost: String,
@@ -28,7 +29,7 @@ class ReplicaLink(
             } catch (e: CancellationException) {
                 throw e
             } catch (e: Throwable) {
-                println("replica link lỗi: ${e.message} — thử lại sau 1s")
+                println("replica link error: ${e.message} — retrying in 1s")
                 executor.setLinkUp(false)
                 delay(1000)
             }
@@ -44,7 +45,7 @@ class ReplicaLink(
 
             suspend fun cmd(vararg parts: String) =
                 write.writeResp(RespValue.Array(parts.map { RespValue.bulk(it) }))
-            suspend fun line(): String = read.readUTF8Line() ?: throw RuntimeException("master đóng kết nối")
+            suspend fun line(): String = read.readUTF8Line() ?: throw RuntimeException("master closed connection")
 
             // 1) handshake
             cmd("PING"); line()                                          // +PONG
@@ -53,22 +54,22 @@ class ReplicaLink(
             cmd("PSYNC", "?", "-1")
             println("replica: ${line()}")                                // +FULLRESYNC <id> <off>
 
-            // 2) nhận RDB: $<len>\r\n<bytes> (KHÔNG có CRLF cuối)
+            // 2) receive RDB: $<len>\r\n<bytes> (no trailing CRLF)
             val lenLine = line()
-            require(lenLine.startsWith("$")) { "mong đợi \$<len> nhưng nhận: $lenLine" }
+            require(lenLine.startsWith("$")) { "expected \$<len> but got: $lenLine" }
             val len = lenLine.substring(1).toInt()
             val rdb = read.readByteArray(len)
             executor.installSnapshot(Rdb.load(ByteArrayInputStream(rdb)))
             executor.setLinkUp(true)
-            println("replica: đã nạp RDB ($len bytes), bắt đầu nhận stream từ master")
+            println("replica: RDB loaded ($len bytes), starting command stream from master")
 
-            // 3) stream: áp dụng mọi lệnh ghi master gửi xuống
+            // 3) command stream: apply all write commands from master
             val reader = RespReader(read)
             while (true) {
                 val command = reader.readCommand() ?: break
                 if (command.isNotEmpty()) executor.applyReplicated(command)
             }
-            throw RuntimeException("master ngắt stream")                 // -> vòng ngoài thử kết nối lại
+            throw RuntimeException("master closed stream")                // -> outer loop retries
         } finally {
             socket.close()
             selector.close()

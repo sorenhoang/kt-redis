@@ -1,4 +1,4 @@
 package io.ktredis.helper
 
-// File nháp cũ — đã bỏ. Bản RDB chính thức nằm ở io.ktredis.persistence.Rdb
-// Bạn có thể xoá hẳn file này và thư mục helper/.
+// Old draft file — removed. The official RDB implementation is in io.ktredis.persistence.Rdb
+// You can delete this file and the helper/ directory entirely.

@@ -16,7 +16,7 @@ class SetCommandsTest {
 
     @Test fun `sadd dedupes and scard`() {
         assertEquals(RespValue.int(3), d.dispatch(cmd("SADD", "s", "a", "b", "c")))
-        assertEquals(RespValue.int(0), d.dispatch(cmd("SADD", "s", "a")))   // trùng, không thêm
+        assertEquals(RespValue.int(0), d.dispatch(cmd("SADD", "s", "a")))   // duplicate, not added
         assertEquals(RespValue.int(3), d.dispatch(cmd("SCARD", "s")))
     }
 

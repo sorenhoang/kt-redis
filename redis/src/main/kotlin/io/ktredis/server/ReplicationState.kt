@@ -2,16 +2,16 @@ package io.ktredis.server
 
 enum class Role { MASTER, REPLICA }
 
-/** Trạng thái replication cấp server (sống trong CommandExecutor). */
+/** Server-level replication state (lives inside CommandExecutor). */
 class ReplicationState {
     var role: Role = Role.MASTER
     val replId: String = randomHexId()
     var masterReplOffset: Long = 0L
 
-    // master: các connection đã PSYNC
+    // master: connections that have completed PSYNC
     val replicas: MutableSet<ClientHandle> = LinkedHashSet()
 
-    // replica: thông tin master đang theo
+    // replica: info about the master being followed
     var masterHost: String? = null
     var masterPort: Int = 0
     var linkUp: Boolean = false

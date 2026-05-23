@@ -13,7 +13,7 @@ class RespReader(private val channel: ByteReadChannel) {
 
         return when (line[0]) {
             '*' -> readArray(line)
-            else -> line.trim().split(" ").filter { it.isNotEmpty() }.map { it.toByteArray() } // inline (tạm)
+            else -> line.trim().split(" ").filter { it.isNotEmpty() }.map { it.toByteArray() } // inline command (temporary)
         }
     }
 

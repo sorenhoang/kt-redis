@@ -1,13 +1,13 @@
 package io.ktredis.command
 
 /**
- * Khớp chuỗi với glob pattern kiểu Redis:
- *   *        khớp 0+ ký tự
- *   ?        khớp đúng 1 ký tự
- *   [abc]    khớp 1 ký tự trong tập
- *   [a-z]    khớp 1 ký tự trong khoảng
- *   [^...]   phủ định
- *   \x       ký tự literal x
+ * Matches a string against a Redis-style glob pattern:
+ *   *        matches 0 or more characters
+ *   ?        matches exactly 1 character
+ *   [abc]    matches 1 character in the set
+ *   [a-z]    matches 1 character in the range
+ *   [^...]   negation
+ *   \x       literal character x
  */
 fun globMatch(pattern: String, str: String): Boolean = match(pattern, 0, str, 0)
 
@@ -17,8 +17,8 @@ private fun match(p: String, pi0: Int, s: String, si0: Int): Boolean {
     while (pi < p.length) {
         when (p[pi]) {
             '*' -> {
-                while (pi + 1 < p.length && p[pi + 1] == '*') pi++   // gộp '**'
-                if (pi + 1 == p.length) return true                  // '*' cuối khớp phần còn lại
+                while (pi + 1 < p.length && p[pi + 1] == '*') pi++   // collapse '**'
+                if (pi + 1 == p.length) return true                  // trailing '*' matches the rest
                 for (k in si..s.length) if (match(p, pi + 1, s, k)) return true
                 return false
             }

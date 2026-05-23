@@ -28,7 +28,7 @@ class StringCommandsTest {
     @Test fun `incr keeps ttl`() {
         d.dispatch(cmd("SET", "n", "5", "EX", "100"))
         d.dispatch(cmd("INCR", "n"))
-        assertEquals(RespValue.int(100), d.dispatch(cmd("TTL", "n")))   // TTL không bị xoá
+        assertEquals(RespValue.int(100), d.dispatch(cmd("TTL", "n")))   // TTL not cleared
     }
 
     @Test fun `append returns new length`() {

@@ -6,19 +6,19 @@ class ClusterNode(
     val id: String,
     var ip: String,
     var port: Int,
-    var cport: Int,                                  // cổng cluster-bus (quy ước = port + 10000)
+    var cport: Int,                                  // cluster-bus port (convention: port + 10000)
     var epoch: Long,
     val slots: java.util.TreeSet<Int> = java.util.TreeSet(),
     val myself: Boolean = false
 )
 
 /**
- * Trạng thái cluster của một node: bảng các node đã biết + bản đồ slot -> chủ sở hữu.
- * Tất cả thao tác chạy trên writer-thread (single-threaded cooperative) nên không cần khóa.
+ * Cluster state for a node: known node table + slot-to-owner map.
+ * All operations run on the writer thread (single-threaded cooperative) so no locking is needed.
  */
 class ClusterState(myHost: String, myPort: Int) {
     val myId: String = randomId()
-    val nodes = LinkedHashMap<String, ClusterNode>()         // id -> node (gồm cả chính mình)
+    val nodes = LinkedHashMap<String, ClusterNode>()         // id -> node (includes self)
     private val slotOwner = arrayOfNulls<String>(Crc16.SLOTS) // slot -> nodeId
     private val me = ClusterNode(myId, myHost, myPort, myPort + 10000, 0, myself = true)
 
@@ -26,7 +26,7 @@ class ClusterState(myHost: String, myPort: Int) {
 
     // ---------- slot ----------
     fun addSlots(slots: List<Int>) {
-        me.epoch++                                           // claim mới -> epoch cao hơn để thắng khi gossip
+        me.epoch++                                           // new claim -> higher epoch wins during gossip
         for (s in slots) {
             if (s !in 0 until Crc16.SLOTS) continue
             slotOwner[s]?.let { old -> if (old != myId) nodes[old]?.slots?.remove(s) }
@@ -49,7 +49,7 @@ class ClusterState(myHost: String, myPort: Int) {
     }
 
     // ---------- gossip: serialize / merge ----------
-    /** Mỗi dòng: id ip port cport epoch slotRanges(',' phân tách hoặc '-'). */
+    /** Each line: id ip port cport epoch slotRanges (comma-separated or '-' for ranges). */
     fun serialize(): String = buildString {
         for (n in nodes.values) {
             append(n.id).append(' ').append(n.ip).append(' ').append(n.port).append(' ')
@@ -65,12 +65,12 @@ class ClusterState(myHost: String, myPort: Int) {
             val f = line.trim().split(' ')
             if (f.size < 6) continue
             val (id, ip, portS, cportS, epochS) = f
-            if (id == myId) continue                          // không ghi đè thông tin của chính mình
+            if (id == myId) continue                          // do not overwrite our own node info
             val port = portS.toIntOrNull() ?: continue
             val epoch = epochS.toLongOrNull() ?: 0L
             val node = nodes.getOrPut(id) { ClusterNode(id, ip, port, cportS.toIntOrNull() ?: port + 10000, epoch) }
             node.ip = ip; node.port = port; node.cport = cportS.toIntOrNull() ?: node.cport
-            if (epoch >= node.epoch) {                        // claim mới hơn (hoặc bằng) -> nhận slot của node này
+            if (epoch >= node.epoch) {                        // newer (or equal) epoch -> accept slot ownership from this node
                 node.epoch = epoch
                 node.slots.toList().forEach { if (slotOwner[it] == id) slotOwner[it] = null }
                 node.slots.clear()
@@ -81,7 +81,7 @@ class ClusterState(myHost: String, myPort: Int) {
         }
     }
 
-    // ---------- replies cho lệnh CLUSTER ----------
+    // ---------- replies for CLUSTER commands ----------
     fun info(): String = buildString {
         val ok = assignedCount() == Crc16.SLOTS
         append("cluster_enabled:1\r\n")
@@ -91,7 +91,7 @@ class ClusterState(myHost: String, myPort: Int) {
         append("cluster_size:${servingNodes()}\r\n")
     }
 
-    /** Định dạng CLUSTER NODES của Redis: <id> <ip:port@cport> <flags> <master> <ping> <pong> <epoch> connected <slots> */
+    /** Redis CLUSTER NODES format: <id> <ip:port@cport> <flags> <master> <ping> <pong> <epoch> connected <slots> */
     fun nodesText(): String = buildString {
         for (n in nodes.values) {
             val flags = if (n.myself) "myself,master" else "master"
@@ -124,7 +124,7 @@ class ClusterState(myHost: String, myPort: Int) {
             return buildString { repeat(40) { append(c.random()) } }
         }
 
-        /** Gom các slot rời rạc thành các dải liền nhau [start,end]. */
+        /** Collapses discrete slot numbers into contiguous ranges [start,end]. */
         private fun ranges(slots: java.util.TreeSet<Int>): List<Pair<Int, Int>> {
             val out = ArrayList<Pair<Int, Int>>()
             var start = -1; var prev = -2

@@ -170,7 +170,7 @@ class CommandDispatcher(private val db: RedisDatabase) {
     private fun ttl(args: List<ByteArray>, seconds: Boolean): RespValue {
         if (args.size != 2) return RespValue.error("ERR wrong number of arguments")
         val ms = db.pttl(keyOf(args[1]))
-        if (ms < 0) return RespValue.int(ms)               // -1 hoặc -2
+        if (ms < 0) return RespValue.int(ms)               // -1 or -2
         return RespValue.int(if (seconds) (ms + 500) / 1000 else ms)
     }
 
@@ -215,21 +215,21 @@ class CommandDispatcher(private val db: RedisDatabase) {
 
                 "COUNT" -> {
                     if (i + 1 >= args.size) return syntaxError(); i += 2
-                }   // bỏ qua (đơn giản hoá)
+                }   // ignored (simplified)
                 else -> return syntaxError()
             }
         }
         val matched = db.keys().filter { globMatch(pattern, it) }
         return RespValue.Array(
             listOf(
-                RespValue.bulk("0"),                                  // cursor luôn 0 — quét hết trong 1 lần
+                RespValue.bulk("0"),                                  // cursor always 0 — full scan in one call
                 RespValue.Array(matched.map { RespValue.bulk(it) })
             )
         )
     }
 
     // ---------- string / số ----------
-    /** Trả (lỗi, data). Không tồn tại -> (null, null). Sai kiểu -> (wrongType, null). */
+    /** Returns (error, data). Key absent -> (null, null). Wrong type -> (wrongType, null). */
     private fun currentString(key: String): Pair<RespValue?, ByteArray?> {
         val obj = db.get(key) ?: return null to null
         if (obj !is RedisObject.StringValue) return wrongType() to null
@@ -302,7 +302,7 @@ class CommandDispatcher(private val db: RedisDatabase) {
         val base = data ?: ByteArray(0)
         if (value.isEmpty()) return RespValue.int(base.size.toLong())
         val newLen = maxOf(base.size, offset + value.size)
-        val result = ByteArray(newLen)                       // tự pad \x00
+        val result = ByteArray(newLen)                       // zero-padded automatically
         System.arraycopy(base, 0, result, 0, base.size)
         System.arraycopy(value, 0, result, offset, value.size)
         db.setKeepTtl(key, RedisObject.StringValue(result))
@@ -314,7 +314,7 @@ class CommandDispatcher(private val db: RedisDatabase) {
             return RespValue.error("ERR wrong number of arguments for 'mset' command")
         var i = 1
         while (i + 1 < args.size) {
-            db.set(keyOf(args[i]), RedisObject.StringValue(args[i + 1]))   // MSET xoá TTL như SET
+            db.set(keyOf(args[i]), RedisObject.StringValue(args[i + 1]))   // MSET clears TTL like SET
             i += 2
         }
         return RespValue.OK
@@ -346,7 +346,7 @@ class CommandDispatcher(private val db: RedisDatabase) {
         val key = keyOf(args[1])
         val obj = db.get(key)
         if (obj != null && obj !is RedisObject.ListValue) return wrongType()
-        if (obj == null && requireExists) return RespValue.int(0)        // *PUSHX khi key chưa có
+        if (obj == null && requireExists) return RespValue.int(0)        // *PUSHX when key does not exist
         val list = if (obj is RedisObject.ListValue) obj.items
         else ArrayDeque<ByteArray>().also { db.setKeepTtl(key, RedisObject.ListValue(it)) }
         for (i in 2 until args.size) {
@@ -413,7 +413,7 @@ class CommandDispatcher(private val db: RedisDatabase) {
 
         if (count == null) {
             val v = if (fromHead) list.removeFirst() else list.removeLast()
-            if (list.isEmpty()) db.delete(key)        // Redis không giữ list rỗng
+            if (list.isEmpty()) db.delete(key)        // Redis does not retain empty lists
             return RespValue.bulk(v)
         }
         val n = minOf(count, list.size)
@@ -434,7 +434,7 @@ class CommandDispatcher(private val db: RedisDatabase) {
         var i = 2
         while (i + 1 < args.size) {
             val f = keyOf(args[i])
-            if (!fields.containsKey(f)) added++          // chỉ đếm field MỚI
+            if (!fields.containsKey(f)) added++          // only count NEW fields
             fields[f] = args[i + 1]
             i += 2
         }
@@ -480,7 +480,7 @@ class CommandDispatcher(private val db: RedisDatabase) {
         if (fields == null) return RespValue.int(0)
         var removed = 0L
         for (i in 2 until args.size) if (fields.remove(keyOf(args[i])) != null) removed++
-        if (fields.isEmpty()) db.delete(key)             // hash rỗng -> xoá key
+        if (fields.isEmpty()) db.delete(key)             // empty hash -> delete key
         return RespValue.int(removed)
     }
 
@@ -534,7 +534,7 @@ class CommandDispatcher(private val db: RedisDatabase) {
         return null to obj.members
     }
 
-    /** Gom các set từ args[from..]. Key thiếu = set rỗng. Sai kiểu -> lỗi. */
+    /** Collects sets from args[from..]. Missing key = empty set. Wrong type -> error. */
     private fun gatherSets(args: List<ByteArray>, from: Int): Pair<RespValue?, List<Set<String>>?> {
         val sets = ArrayList<Set<String>>()
         for (i in from until args.size) {
@@ -635,14 +635,14 @@ class CommandDispatcher(private val db: RedisDatabase) {
             return if (count == null) RespValue.NIL else RespValue.Array(emptyList())
         if (count == null) return RespValue.bulk(set.random())
         return if (count >= 0) {
-            RespValue.Array(set.shuffled().take(count).map { RespValue.bulk(it) })   // không trùng
+            RespValue.Array(set.shuffled().take(count).map { RespValue.bulk(it) })   // no duplicates
         } else {
             val list = set.toList()
-            RespValue.Array((1..(-count)).map { RespValue.bulk(list.random()) })       // cho phép trùng
+            RespValue.Array((1..(-count)).map { RespValue.bulk(list.random()) })       // duplicates allowed
         }
     }
 
-    // --- phép toán tập hợp ---
+    // --- set operations ---
     private fun sinter(args: List<ByteArray>): RespValue {
         if (args.size < 2) return RespValue.error("ERR wrong number of arguments")
         val (err, sets) = gatherSets(args, 1); if (err != null) return err
@@ -664,17 +664,17 @@ class CommandDispatcher(private val db: RedisDatabase) {
     // SINTERSTORE/SUNIONSTORE/SDIFFSTORE dest key [key...]
     private fun storeOp(args: List<ByteArray>, op: (List<Set<String>>) -> Set<String>): RespValue {
         if (args.size < 3) return RespValue.error("ERR wrong number of arguments")
-        val (err, sets) = gatherSets(args, 2); if (err != null) return err   // bỏ qua dest ở index 1
+        val (err, sets) = gatherSets(args, 2); if (err != null) return err   // skip dest at index 1
         val result = op(sets!!)
         val dest = keyOf(args[1])
         if (result.isEmpty()) db.delete(dest)
-        else db.set(dest, RedisObject.SetValue(LinkedHashSet(result)))        // STORE ghi đè -> dùng db.set
+        else db.set(dest, RedisObject.SetValue(LinkedHashSet(result)))        // STORE overwrites -> use db.set
         return RespValue.int(result.size.toLong())
     }
 
     private fun formatScore(d: Double): String = when {
         d.isInfinite() -> if (d > 0) "inf" else "-inf"
-        d == d.toLong().toDouble() -> d.toLong().toString()    // số nguyên -> bỏ ".0"
+        d == d.toLong().toDouble() -> d.toLong().toString()    // integer value -> strip ".0"
         else -> d.toString()
     }
 

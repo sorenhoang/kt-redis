@@ -19,8 +19,8 @@ class ExpiryTest {
 
     @Test fun `px expires after time advances`() {
         d.dispatch(cmd("SET", "k", "v", "PX", "100"))
-        assertEquals("v", str(d.dispatch(cmd("GET", "k"))))   // còn sống
-        clock.time += 150                                      // "tua" 150ms
+        assertEquals("v", str(d.dispatch(cmd("GET", "k"))))   // still alive
+        clock.time += 150                                      // advance 150ms
         assertEquals(RespValue.NIL, d.dispatch(cmd("GET", "k")))
         assertEquals(RespValue.int(-2), d.dispatch(cmd("TTL", "k")))
     }
@@ -39,7 +39,7 @@ class ExpiryTest {
 
     @Test fun `set clears old ttl`() {
         d.dispatch(cmd("SET", "k", "v", "EX", "100"))
-        d.dispatch(cmd("SET", "k", "v2"))                      // SET lại → mất TTL
+        d.dispatch(cmd("SET", "k", "v2"))                      // re-SET -> TTL cleared
         assertEquals(RespValue.int(-1), d.dispatch(cmd("TTL", "k")))
     }
 }

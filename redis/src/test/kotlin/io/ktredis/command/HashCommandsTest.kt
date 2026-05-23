@@ -16,7 +16,7 @@ class HashCommandsTest {
 
     @Test fun `hset counts new fields`() {
         assertEquals(RespValue.int(2), d.dispatch(cmd("HSET", "h", "a", "1", "b", "2")))
-        assertEquals(RespValue.int(0), d.dispatch(cmd("HSET", "h", "a", "9")))   // ghi đè, không tính
+        assertEquals(RespValue.int(0), d.dispatch(cmd("HSET", "h", "a", "9")))   // overwrite, not counted
         assertEquals("9", str(d.dispatch(cmd("HGET", "h", "a"))))
     }
 

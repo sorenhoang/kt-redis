@@ -58,7 +58,7 @@ class RedisDatabase(private val clock: Clock = SystemClock){
     }
 
     // ---------- keyspace ----------
-    /** Danh sách key còn sống (đã dọn key hết hạn trước khi liệt kê). */
+    /** List of live keys (expired keys cleaned up before listing). */
     fun keys(): List<String> {
         map.keys.toList().forEach { expireIfNeeded(it) }
         return map.keys.toList()
@@ -69,7 +69,7 @@ class RedisDatabase(private val clock: Clock = SystemClock){
         expires.clear()
     }
 
-    /** Đổi tên key, mang theo TTL. Trả false nếu src không tồn tại. */
+    /** Renames a key, carrying its TTL along. Returns false if src does not exist. */
     fun rename(src: String, dst: String): Boolean {
         expireIfNeeded(src)
         val value = map[src] ?: return false
@@ -80,7 +80,7 @@ class RedisDatabase(private val clock: Clock = SystemClock){
         return true
     }
 
-    /** Ghi value nhưng GIỮ TTL hiện có (cho INCR/APPEND/SETRANGE...). */
+    /** Writes a value while PRESERVING the existing TTL (for INCR/APPEND/SETRANGE...). */
     fun setKeepTtl(key: String, value: RedisObject) {
         map[key] = value
     }
